@@ -71,15 +71,23 @@ func (w *Worker) safeProcess(job Job) (success bool) {
 func (w *Worker) process(job Job) bool {
 	fmt.Println("Processing job:", job.ID)
 
-	job.Status = "processing"
-	job.WorkerID = w.ID
-	job.Attempt++
-	job.LeaseUntil = time.Now().Add(leaseDuration)
+	claimedJob, claimed, err := w.store.Claim(job.ID, w.ID)
 
-	w.store.Set(job)
+	if err != nil {
+		fmt.Println("Failed to claim job:", err)
+		return true
+	}
+
+	if !claimed {
+		fmt.Println("Job was already claimed:", job.ID)
+		return true
+	}
+
+	job = claimedJob
 
 	stopHeartbeat := make(chan bool)
 	defer close(stopHeartbeat)
+
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -88,10 +96,9 @@ func (w *Worker) process(job Job) bool {
 		for {
 			select {
 			case <-ticker.C:
-				if !w.store.RenewLease(job.ID, leaseDuration) {
+				if !w.store.RenewLease(job.ID, w.ID, job.Attempt, leaseDuration) {
 					return
 				}
-
 				fmt.Println("Heartbeat:", job.ID)
 
 			case <-stopHeartbeat:
@@ -103,7 +110,9 @@ func (w *Worker) process(job Job) bool {
 	var result int
 
 	switch job.Type {
+
 	case "addition":
+//		time.Sleep(15 * time.Second)
 		result = job.A + job.B
 
 	case "multiplication":

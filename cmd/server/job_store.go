@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"sync"
 	"time"
 )
@@ -12,10 +13,10 @@ import (
 type JobStore struct {
 	mu   sync.RWMutex
 	jobs map[string]Job
-	db   *pgx.Conn
+	db   *pgxpool.Pool
 }
 
-func NewJobStore(db *pgx.Conn) *JobStore {
+func NewJobStore(db *pgxpool.Pool) *JobStore {
 	return &JobStore{
 		jobs: make(map[string]Job),
 		db:   db,
@@ -50,6 +51,7 @@ func (s *JobStore) LoadJobsFromDB() error {
 
 	for rows.Next() {
 		var job Job
+		var workerID pgtype.Text
 		var leaseUntil pgtype.Timestamptz
 
 		err := rows.Scan(
@@ -60,12 +62,21 @@ func (s *JobStore) LoadJobsFromDB() error {
 			&job.Status,
 			&job.Result,
 			&job.Retries,
-			&job.WorkerID,
+			&workerID,
 			&job.Attempt,
 			&leaseUntil,
 		)
+
 		if err != nil {
 			return err
+		}
+
+		if workerID.Valid {
+			job.WorkerID = workerID.String
+		}
+
+		if leaseUntil.Valid {
+			job.LeaseUntil = leaseUntil.Time
 		}
 
 		s.jobs[job.ID] = job
@@ -146,34 +157,24 @@ func (s *JobStore) GetAll() []Job {
 	return jobs
 }
 
-func (s *JobStore) RenewLease(id string, duration time.Duration) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	job, ok := s.jobs[id]
-	if !ok {
-		return false
-	}
-
-	if job.Status != "processing" {
-		return false
-	}
-
+func (s *JobStore) RenewLease(id string, workerID string, attempt int, duration time.Duration) bool {
 	newLease := time.Now().Add(duration)
-	job.LeaseUntil = newLease
 
-	s.jobs[id] = job
-
-	_, err := s.db.Exec(
+	// PostgreSQL decides whether this worker still owns the job.
+	tag, err := s.db.Exec(
 		context.Background(),
 		`
 		UPDATE jobs
 		SET lease_until = $1
 		WHERE id = $2
 		  AND status = 'processing'
+		  AND worker_id = $3
+		  AND attempt = $4
 		`,
 		newLease,
 		id,
+		workerID,
+		attempt,
 	)
 
 	if err != nil {
@@ -181,53 +182,47 @@ func (s *JobStore) RenewLease(id string, duration time.Duration) bool {
 		return false
 	}
 
-	return true
-}
+	// Worker no longer owns the job.
+	if tag.RowsAffected() == 0 {
+		return false
+	}
 
-func (s *JobStore) Complete(id string, workerID string, attempt int, result int) bool {
+	// PostgreSQL accepted the renewal.
+	// Synchronize the in-memory copy.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	job, ok := s.jobs[id]
 	if !ok {
-		return false
+		return true
 	}
 
-	if job.Status != "processing" {
-		return false
-	}
-
-	if job.Attempt != attempt {
-		return false
-	}
-
-	if job.WorkerID != workerID {
-		return false
-	}
-
-	job.Result = result
-	job.Status = "completed"
-	job.WorkerID = ""
-	job.LeaseUntil = time.Time{}
-
+	job.LeaseUntil = newLease
 	s.jobs[id] = job
 
-	_, err := s.db.Exec(
+	return true
+}
+
+func (s *JobStore) Complete(id string, workerID string, attempt int, result int) bool {
+	// PostgreSQL is now the authority for completion.
+	tag, err := s.db.Exec(
 		context.Background(),
 		`
 		UPDATE jobs
 		SET
-			status = $1,
-			result = $2,
-			worker_id = $3,
-			lease_until = $4
-		WHERE id = $5
+			status = 'completed',
+			result = $1,
+			worker_id = NULL,
+			lease_until = NULL
+		WHERE id = $2
+		  AND status = 'processing'
+		  AND worker_id = $3
+		  AND attempt = $4
 		`,
-		job.Status,
-		job.Result,
-		job.WorkerID,
-		nil,
-		job.ID,
+		result,
+		id,
+		workerID,
+		attempt,
 	)
 
 	if err != nil {
@@ -235,54 +230,161 @@ func (s *JobStore) Complete(id string, workerID string, attempt int, result int)
 		return false
 	}
 
-	return true
-}
+	// No row was updated means this worker no longer owns the job.
+	if tag.RowsAffected() == 0 {
+		return false
+	}
 
-func (s *JobStore) Recover(id string) bool {
+	// PostgreSQL accepted the completion.
+	// Now synchronize the in-memory copy.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	job, ok := s.jobs[id]
 	if !ok {
-		return false
+		return true
 	}
 
-	if job.Status != "processing" {
-		return false
-	}
-
-	if time.Now().Before(job.LeaseUntil) {
-		return false
-	}
-
-	job.Status = "queued"
+	job.Status = "completed"
+	job.Result = result
 	job.WorkerID = ""
 	job.LeaseUntil = time.Time{}
 
 	s.jobs[id] = job
 
-	_, err := s.db.Exec(
+	return true
+}
+
+func (s *JobStore) Recover(id string) (Job, bool, error) {
+	var job Job
+	var workerID pgtype.Text
+	var leaseUntil pgtype.Timestamptz
+
+	err := s.db.QueryRow(
 		context.Background(),
 		`
 		UPDATE jobs
 		SET
-			status = $1,
-			worker_id = $2,
-			lease_until = $3
-		WHERE id = $4
+			status = CASE
+				WHEN retries + 1 >= 3 THEN 'failed'
+				ELSE 'queued'
+			END,
+			retries = retries + 1,
+			worker_id = NULL,
+			lease_until = NULL
+		WHERE id = $1
 		  AND status = 'processing'
 		  AND lease_until <= NOW()
+		RETURNING
+			id,
+			type,
+			a,
+			b,
+			status,
+			COALESCE(result, 0),
+			retries,
+			worker_id,
+			attempt,
+			lease_until
 		`,
-		job.Status,
-		nil,
-		nil,
-		job.ID,
+		id,
+	).Scan(
+		&job.ID,
+		&job.Type,
+		&job.A,
+		&job.B,
+		&job.Status,
+		&job.Result,
+		&job.Retries,
+		&workerID,
+		&job.Attempt,
+		&leaseUntil,
 	)
+
+	if err == pgx.ErrNoRows {
+		return Job{}, false, nil
+	}
 
 	if err != nil {
 		fmt.Println("Database Recover error:", err)
-		return false
+		return Job{}, false, err
 	}
 
-	return true
+	if workerID.Valid {
+		job.WorkerID = workerID.String
+	}
+
+	if leaseUntil.Valid {
+		job.LeaseUntil = leaseUntil.Time
+	}
+
+	s.mu.Lock()
+	s.jobs[job.ID] = job
+	s.mu.Unlock()
+
+	return job, true, nil
+}
+
+func (s *JobStore) Claim(id string, workerID string) (Job, bool, error) {
+	var job Job
+	var worker string
+	var leaseUntil time.Time
+
+	err := s.db.QueryRow(
+		context.Background(),
+		`
+		UPDATE jobs
+		SET
+			status = 'processing',
+			worker_id = $1,
+			attempt = attempt + 1,
+			lease_until = NOW() + INTERVAL '10 seconds'
+		WHERE id = $2
+		  AND status = 'queued'
+		RETURNING
+			id,
+			type,
+			a,
+			b,
+			status,
+			COALESCE(result, 0),
+			retries,
+			worker_id,
+			attempt,
+			lease_until
+		`,
+		workerID,
+		id,
+	).Scan(
+		&job.ID,
+		&job.Type,
+		&job.A,
+		&job.B,
+		&job.Status,
+		&job.Result,
+		&job.Retries,
+		&job.WorkerID,
+		&job.Attempt,
+		&leaseUntil,
+	)
+
+	if err == pgx.ErrNoRows {
+		// Job is no longer queued.
+		// Another worker may have already claimed it.
+		return Job{}, false, nil
+	}
+
+	if err != nil {
+		return Job{}, false, err
+	}
+
+	job.WorkerID = worker
+	job.LeaseUntil = leaseUntil
+
+	// Keep the temporary in-memory copy synchronized.
+	s.mu.Lock()
+	s.jobs[job.ID] = job
+	s.mu.Unlock()
+
+	return job, true, nil
 }

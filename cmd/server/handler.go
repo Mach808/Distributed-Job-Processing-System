@@ -4,19 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sync"
+	"time"
 )
 
-var jobCounter uint64
-var jobCounterMu sync.Mutex
-
 func generateJobID() string {
-	jobCounterMu.Lock()
-	defer jobCounterMu.Unlock()
-
-	jobCounter++
-
-	return fmt.Sprintf("job-%d", jobCounter)
+	return fmt.Sprintf("job-%d", time.Now().UnixNano())
 }
 
 type JobRequest struct {

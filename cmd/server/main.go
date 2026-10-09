@@ -1,10 +1,9 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"net/http"
-
+	"os"
 	"github.com/joho/godotenv"
 )
 
@@ -20,7 +19,7 @@ func main() {
 		return
 	}
 
-	defer db.Close(context.Background())
+	defer db.Close()
 
 	fmt.Println("Connected to Neon PostgreSQL!")
 	queue := NewQueue(10)
@@ -50,10 +49,14 @@ func main() {
 		fmt.Fprintln(w, "Distributed Job System is running!")
 	})
 
-	fmt.Println("Server starting on port 8080...")
+	port := os.Getenv("PORT")
 
-	err = http.ListenAndServe(":8080", nil)
+	if port == "" {
+		port = "8080"
+	}
+	fmt.Println("Server starting on port",port)
 
+	err = http.ListenAndServe(":"+port, nil)
 	if err != nil {
 		fmt.Println("Server failed:", err)
 	}
