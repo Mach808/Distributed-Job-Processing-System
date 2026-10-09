@@ -1,63 +1,77 @@
 package main
 
 import (
+	"context"
+	"embed"
+	"errors"
 	"fmt"
+	"io/fs"
+	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
 	"github.com/joho/godotenv"
 )
 
-func main() {
-	err := godotenv.Load()
-	if err != nil {
-		fmt.Println("Warning: .env file not found")
-	}
+//go:embed dashboard
+var dashboardFiles embed.FS
 
+func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found; using environment variables")
+	}
 	db, err := connectDB()
 	if err != nil {
-		fmt.Println("Database connection failed:", err)
-		return
+		log.Fatalf("database connection failed: %v", err)
 	}
-
 	defer db.Close()
+	log.Println("connected to PostgreSQL")
 
-	fmt.Println("Connected to Neon PostgreSQL!")
-	queue := NewQueue(10)
 	store := NewJobStore(db)
-
-	err = store.LoadJobsFromDB()
-	if err != nil {
-		fmt.Println("Failed to load jobs from database:", err)
-		return
-	}
-
-	fmt.Println("Jobs loaded from database")
-
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	for i := 0; i < 3; i++ {
-		worker := NewWorker(fmt.Sprintf("worker-%d", i+1), queue, store)
-		go worker.Start()
+		worker := NewWorker(fmt.Sprintf("worker-%d", i+1), store)
+		go worker.Start(ctx)
 	}
+	go startRecovery(ctx, store)
 
-	go startRecovery(store, queue)
-
-	handler := NewHandler(queue, store)
-
-	http.HandleFunc("POST /jobs", handler.CreateJob)
-	http.HandleFunc("GET /jobs/{id}", handler.GetJob)
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Distributed Job System is running!")
-	})
+	mux := http.NewServeMux()
+	handler := NewHandler(store)
+	mux.HandleFunc("POST /jobs", handler.CreateJob)
+	mux.HandleFunc("GET /jobs/{id}", handler.GetJob)
+	dashboard, err := newDashboardHandler()
+	if err != nil {
+		log.Fatalf("load dashboard files: %v", err)
+	}
+	mux.Handle("GET /", dashboard)
 
 	port := os.Getenv("PORT")
-
 	if port == "" {
 		port = "8080"
 	}
-	fmt.Println("Server starting on port",port)
-
-	err = http.ListenAndServe(":"+port, nil)
-	if err != nil {
-		fmt.Println("Server failed:", err)
+	server := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP shutdown: %v", err)
+		}
+	}()
+	log.Printf("server listening on port %s", port)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("HTTP server failed: %v", err)
 	}
+}
+
+func newDashboardHandler() (http.Handler, error) {
+	dashboard, err := fs.Sub(dashboardFiles, "dashboard")
+	if err != nil {
+		return nil, err
+	}
+	return http.FileServer(http.FS(dashboard)), nil
 }

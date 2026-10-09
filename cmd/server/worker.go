@@ -1,139 +1,188 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"time"
 )
 
 const (
-	leaseDuration = 10 * time.Second
+	leaseDuration = 30 * time.Second
+	pollInterval  = 500 * time.Millisecond
 	maxRetries    = 3
 )
 
 type Worker struct {
 	ID    string
-	queue *Queue
 	store *JobStore
 }
 
-func NewWorker(id string, queue *Queue, store *JobStore) *Worker {
-	return &Worker{
-		ID:    id,
-		queue: queue,
-		store: store,
-	}
+func NewWorker(id string, store *JobStore) *Worker {
+	return &Worker{ID: id, store: store}
 }
 
-func (w *Worker) Start() {
-	fmt.Println("Worker started")
-
+// Start continuously claims jobs from PostgreSQL. The database is the only queue;
+// workers never depend on process-local job state.
+func (w *Worker) Start(ctx context.Context) {
+	log.Printf("worker %s started", w.ID)
 	for {
-		job := w.queue.Dequeue()
-
-		success := w.safeProcess(job)
-
-		if !success {
-			job.Retries++
-
-			fmt.Println("Job failed:", job.ID, "Retry:", job.Retries)
-
-			if job.Retries < maxRetries {
-				job.Status = "queued"
-				job.LeaseUntil = time.Time{}
-				job.WorkerID = ""
-
-				w.store.Set(job)
-				w.queue.Enqueue(job)
-			} else {
-				job.Status = "failed"
-				job.LeaseUntil = time.Time{}
-				job.WorkerID = ""
-
-				w.store.Set(job)
-
-				fmt.Println("Job permanently failed:", job.ID)
-			}
+		if ctx.Err() != nil {
+			return
 		}
-	}
-}
 
-func (w *Worker) safeProcess(job Job) (success bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Println("Worker recovered from panic:", r)
-			success = false
-		}
-	}()
-
-	return w.process(job)
-}
-
-func (w *Worker) process(job Job) bool {
-	fmt.Println("Processing job:", job.ID)
-
-	claimedJob, claimed, err := w.store.Claim(job.ID, w.ID)
-
-	if err != nil {
-		fmt.Println("Failed to claim job:", err)
-		return true
-	}
-
-	if !claimed {
-		fmt.Println("Job was already claimed:", job.ID)
-		return true
-	}
-
-	job = claimedJob
-
-	stopHeartbeat := make(chan bool)
-	defer close(stopHeartbeat)
-
-
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				if !w.store.RenewLease(job.ID, w.ID, job.Attempt, leaseDuration) {
-					return
-				}
-				fmt.Println("Heartbeat:", job.ID)
-
-			case <-stopHeartbeat:
+		job, claimed, err := w.store.ClaimNext(ctx, w.ID, leaseDuration)
+		if err != nil {
+			log.Printf("worker %s: claim job: %v", w.ID, err)
+			if !sleepContext(ctx, pollInterval) {
 				return
 			}
+			continue
+		}
+		if !claimed {
+			if !sleepContext(ctx, pollInterval) {
+				return
+			}
+			continue
+		}
+
+		w.process(ctx, job)
+	}
+}
+
+func (w *Worker) process(parent context.Context, job Job) {
+	ctx, cancel := context.WithCancel(parent)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(leaseDuration / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				ok, err := w.store.RenewLeaseContext(ctx, job.ID, w.ID, job.Attempt, leaseDuration)
+				if err != nil {
+					log.Printf("worker %s: renew lease for %s: %v", w.ID, job.ID, err)
+					cancel()
+					return
+				}
+				if !ok {
+					log.Printf("worker %s lost ownership of job %s attempt %d", w.ID, job.ID, job.Attempt)
+					cancel()
+					return
+				}
+			}
 		}
 	}()
 
-	var result int
+	result, err := runJobSafely(func() (int, error) {
+		return executeJob(job)
+	})
+	cancel()
+	<-heartbeatDone
+	if parent.Err() != nil {
+		return
+	}
+	if err != nil {
+		failed, failErr := w.store.FailAttempt(parent, job.ID, w.ID, job.Attempt, maxRetries)
+		if failErr != nil {
+			log.Printf("worker %s: record failure for %s: %v; lease recovery will handle it", w.ID, job.ID, failErr)
+			return
+		}
+		if failed {
+			log.Printf("worker %s: job %s failed: %v", w.ID, job.ID, err)
+		}
+		return
+	}
 
+	completed, completeErr := w.store.CompleteContext(parent, job.ID, w.ID, job.Attempt, result)
+	if completeErr != nil {
+		log.Printf("worker %s: complete job %s: %v; lease recovery will handle it", w.ID, job.ID, completeErr)
+		return
+	}
+	if completed {
+		log.Printf("worker %s completed job %s result=%d", w.ID, job.ID, result)
+	}
+}
+
+// runJobSafely contains panics raised while executing one job and turns them
+// into ordinary attempt failures so the caller can apply the retry policy.
+func runJobSafely(run func() (int, error)) (result int, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result = 0
+			err = fmt.Errorf("job processing panicked: %v", recovered)
+		}
+	}()
+	return run()
+}
+
+func executeJob(job Job) (int, error) {
 	switch job.Type {
-
 	case "addition":
-//		time.Sleep(15 * time.Second)
-		result = job.A + job.B
-
+		return job.A + job.B, nil
 	case "multiplication":
-		result = job.A * job.B
-
+		return job.A * job.B, nil
+	case "subtraction":
+		return job.A - job.B, nil
+	case "division":
+		if job.B == 0 {
+			return 0, fmt.Errorf("division by zero")
+		}
+		return job.A / job.B, nil
+	case "fibonacci":
+		if job.A < 0 || job.A > 46 {
+			return 0, fmt.Errorf("fibonacci input must be between 0 and 46")
+		}
+		previous, current := 0, 1
+		for i := 0; i < job.A; i++ {
+			previous, current = current, previous+current
+		}
+		return previous, nil
+	case "prime_count":
+		if job.A < 2 || job.A > 10000000 {
+			return 0, fmt.Errorf("prime_count input must be between 2 and 10000000")
+		}
+		return countPrimes(job.A), nil
+	case "retry_demo":
+		if job.A < 0 || job.A >= maxRetries {
+			return 0, fmt.Errorf("retry_demo failure count must be between 0 and %d", maxRetries-1)
+		}
+		if job.Retries < job.A {
+			return 0, fmt.Errorf("demo failure %d of %d", job.Retries+1, job.A)
+		}
+		return job.B, nil
 	default:
-		job.Status = "failed"
-		job.LeaseUntil = time.Time{}
+		return 0, fmt.Errorf("unsupported job type %q", job.Type)
+	}
+}
 
-		w.store.Set(job)
+func countPrimes(limit int) int {
+	composite := make([]bool, limit+1)
+	count := 0
+	for candidate := 2; candidate <= limit; candidate++ {
+		if composite[candidate] {
+			continue
+		}
+		count++
+		if candidate <= limit/candidate {
+			for multiple := candidate * candidate; multiple <= limit; multiple += candidate {
+				composite[multiple] = true
+			}
+		}
+	}
+	return count
+}
 
+func sleepContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
 		return false
+	case <-timer.C:
+		return true
 	}
-
-	if w.store.Complete(job.ID, w.ID, job.Attempt, result) {
-		fmt.Println(
-			"I, worker -", w.ID,
-			"have completed job with job ID", job.ID,
-			"with result", result,
-		)
-	}
-
-	return true
 }

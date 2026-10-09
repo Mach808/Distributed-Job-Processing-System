@@ -2,159 +2,65 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"sync"
+	"log"
 	"time"
 )
 
 type JobStore struct {
-	mu   sync.RWMutex
-	jobs map[string]Job
-	db   *pgxpool.Pool
+	db *pgxpool.Pool
 }
 
 func NewJobStore(db *pgxpool.Pool) *JobStore {
-	return &JobStore{
-		jobs: make(map[string]Job),
-		db:   db,
-	}
-}
-
-func (s *JobStore) LoadJobsFromDB() error {
-	rows, err := s.db.Query(
-		context.Background(),
-		`
-		SELECT
-			id,
-			type,
-			a,
-			b,
-			status,
-			result,
-			retries,
-			worker_id,
-			attempt,
-			lease_until
-		FROM jobs
-		`,
-	)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for rows.Next() {
-		var job Job
-		var workerID pgtype.Text
-		var leaseUntil pgtype.Timestamptz
-
-		err := rows.Scan(
-			&job.ID,
-			&job.Type,
-			&job.A,
-			&job.B,
-			&job.Status,
-			&job.Result,
-			&job.Retries,
-			&workerID,
-			&job.Attempt,
-			&leaseUntil,
-		)
-
-		if err != nil {
-			return err
-		}
-
-		if workerID.Valid {
-			job.WorkerID = workerID.String
-		}
-
-		if leaseUntil.Valid {
-			job.LeaseUntil = leaseUntil.Time
-		}
-
-		s.jobs[job.ID] = job
-	}
-
-	return rows.Err()
-}
-
-func (s *JobStore) Set(job Job) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.jobs[job.ID] = job
-
-	_, err := s.db.Exec(
-		context.Background(),
-		`
-		INSERT INTO jobs (
-			id,
-			type,
-			a,
-			b,
-			status,
-			result,
-			retries,
-			worker_id,
-			attempt,
-			lease_until
-		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (id)
-		DO UPDATE SET
-			type = EXCLUDED.type,
-			a = EXCLUDED.a,
-			b = EXCLUDED.b,
-			status = EXCLUDED.status,
-			result = EXCLUDED.result,
-			retries = EXCLUDED.retries,
-			worker_id = EXCLUDED.worker_id,
-			attempt = EXCLUDED.attempt,
-			lease_until = EXCLUDED.lease_until
-		`,
-		job.ID,
-		job.Type,
-		job.A,
-		job.B,
-		job.Status,
-		job.Result,
-		job.Retries,
-		job.WorkerID,
-		job.Attempt,
-		job.LeaseUntil,
-	)
-
-	if err != nil {
-		fmt.Println("Database Set error:", err)
-	}
+	return &JobStore{db: db}
 }
 
 func (s *JobStore) Get(id string) (Job, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	var job Job
+	var workerID pgtype.Text
+	var leaseUntil pgtype.Timestamptz
 
-	job, ok := s.jobs[id]
+	err := s.db.QueryRow(context.Background(), `
+		SELECT id, type, a, b, status,
+		       COALESCE(result, 0), retries,
+		       worker_id, attempt, lease_until
+		FROM jobs
+		WHERE id = $1
+	`, id).Scan(
+		&job.ID,
+		&job.Type,
+		&job.A,
+		&job.B,
+		&job.Status,
+		&job.Result,
+		&job.Retries,
+		&workerID,
+		&job.Attempt,
+		&leaseUntil,
+	)
 
-	return job, ok
-}
-func (s *JobStore) GetAll() []Job {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Job{}, false
+		}
 
-	jobs := make([]Job, 0, len(s.jobs))
-
-	for _, job := range s.jobs {
-		jobs = append(jobs, job)
+		log.Printf("Failed to get job %s from database: %v", id, err)
+		return Job{}, false
 	}
 
-	return jobs
+	if workerID.Valid {
+		job.WorkerID = workerID.String
+	}
+
+	if leaseUntil.Valid {
+		job.LeaseUntil = leaseUntil.Time
+	}
+
+	return job, true
 }
 
 func (s *JobStore) RenewLease(id string, workerID string, attempt int, duration time.Duration) bool {
@@ -170,6 +76,7 @@ func (s *JobStore) RenewLease(id string, workerID string, attempt int, duration 
 		  AND status = 'processing'
 		  AND worker_id = $3
 		  AND attempt = $4
+		  AND lease_until > NOW()
 		`,
 		newLease,
 		id,
@@ -188,18 +95,6 @@ func (s *JobStore) RenewLease(id string, workerID string, attempt int, duration 
 	}
 
 	// PostgreSQL accepted the renewal.
-	// Synchronize the in-memory copy.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	job, ok := s.jobs[id]
-	if !ok {
-		return true
-	}
-
-	job.LeaseUntil = newLease
-	s.jobs[id] = job
-
 	return true
 }
 
@@ -218,6 +113,7 @@ func (s *JobStore) Complete(id string, workerID string, attempt int, result int)
 		  AND status = 'processing'
 		  AND worker_id = $3
 		  AND attempt = $4
+		  AND lease_until > NOW()
 		`,
 		result,
 		id,
@@ -236,22 +132,6 @@ func (s *JobStore) Complete(id string, workerID string, attempt int, result int)
 	}
 
 	// PostgreSQL accepted the completion.
-	// Now synchronize the in-memory copy.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	job, ok := s.jobs[id]
-	if !ok {
-		return true
-	}
-
-	job.Status = "completed"
-	job.Result = result
-	job.WorkerID = ""
-	job.LeaseUntil = time.Time{}
-
-	s.jobs[id] = job
-
 	return true
 }
 
@@ -318,10 +198,6 @@ func (s *JobStore) Recover(id string) (Job, bool, error) {
 		job.LeaseUntil = leaseUntil.Time
 	}
 
-	s.mu.Lock()
-	s.jobs[job.ID] = job
-	s.mu.Unlock()
-
 	return job, true, nil
 }
 
@@ -381,10 +257,299 @@ func (s *JobStore) Claim(id string, workerID string) (Job, bool, error) {
 	job.WorkerID = worker
 	job.LeaseUntil = leaseUntil
 
-	// Keep the temporary in-memory copy synchronized.
-	s.mu.Lock()
-	s.jobs[job.ID] = job
-	s.mu.Unlock()
+	return job, true, nil
+}
+
+func (s *JobStore) GetExpiredJobs() ([]Job, error) {
+	rows, err := s.db.Query(context.Background(), `
+		SELECT id, type, a, b, status,
+		       COALESCE(result, 0), retries,
+		       worker_id, attempt, lease_until
+		FROM jobs
+		WHERE status = 'processing'
+		  AND lease_until <= NOW()
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query expired jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []Job
+
+	for rows.Next() {
+		var job Job
+		var workerID pgtype.Text
+		var leaseUntil pgtype.Timestamptz
+
+		if err := rows.Scan(
+			&job.ID,
+			&job.Type,
+			&job.A,
+			&job.B,
+			&job.Status,
+			&job.Result,
+			&job.Retries,
+			&workerID,
+			&job.Attempt,
+			&leaseUntil,
+		); err != nil {
+			return nil, fmt.Errorf("scan expired job: %w", err)
+		}
+
+		if workerID.Valid {
+			job.WorkerID = workerID.String
+		}
+		if leaseUntil.Valid {
+			job.LeaseUntil = leaseUntil.Time
+		}
+
+		jobs = append(jobs, job)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate expired jobs: %w", err)
+	}
+
+	return jobs, nil
+}
+
+func (s *JobStore) GetQueuedJobs() ([]Job, error) {
+	rows, err := s.db.Query(context.Background(), `
+		SELECT id, type, a, b, status,
+		       COALESCE(result, 0), retries,
+		       worker_id, attempt, lease_until
+		FROM jobs
+		WHERE status = 'queued'
+		ORDER BY id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query queued jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []Job
+
+	for rows.Next() {
+		var job Job
+		var workerID pgtype.Text
+		var leaseUntil pgtype.Timestamptz
+
+		if err := rows.Scan(
+			&job.ID,
+			&job.Type,
+			&job.A,
+			&job.B,
+			&job.Status,
+			&job.Result,
+			&job.Retries,
+			&workerID,
+			&job.Attempt,
+			&leaseUntil,
+		); err != nil {
+			return nil, fmt.Errorf("scan queued job: %w", err)
+		}
+
+		if workerID.Valid {
+			job.WorkerID = workerID.String
+		}
+		if leaseUntil.Valid {
+			job.LeaseUntil = leaseUntil.Time
+		}
+
+		jobs = append(jobs, job)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate queued jobs: %w", err)
+	}
+
+	return jobs, nil
+}
+
+func (s *JobStore) Create(job Job) error {
+	_, err := s.db.Exec(context.Background(), `
+		INSERT INTO jobs (
+			id, type, a, b, status, result,
+			retries, worker_id, attempt, lease_until
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`,
+		job.ID,
+		job.Type,
+		job.A,
+		job.B,
+		job.Status,
+		job.Result,
+		job.Retries,
+		nil,
+		job.Attempt,
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("create job: %w", err)
+	}
+
+	return nil
+}
+
+func (s *JobStore) ClaimNext(
+	ctx context.Context,
+	workerID string,
+	leaseDuration time.Duration,
+) (Job, bool, error) {
+	leaseSeconds := int(leaseDuration.Seconds())
+	if workerID == "" {
+		return Job{}, false, fmt.Errorf("worker ID cannot be empty")
+	}
+	if leaseSeconds <= 0 {
+		return Job{}, false, fmt.Errorf("lease duration must be at least one second")
+	}
+
+	var job Job
+
+	err := s.db.QueryRow(ctx, `
+        WITH next_job AS (
+            SELECT id
+            FROM jobs
+            WHERE status = 'queued'
+            ORDER BY id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        UPDATE jobs AS j
+        SET
+            status = 'processing',
+            worker_id = $1,
+            attempt = j.attempt + 1,
+            lease_until = NOW() + ($2::integer * INTERVAL '1 second')
+        FROM next_job
+        WHERE j.id = next_job.id
+        RETURNING
+            j.id,
+            j.type,
+            j.a,
+            j.b,
+            j.status,
+            COALESCE(j.result, 0),
+            j.retries,
+            j.worker_id,
+            j.attempt,
+            j.lease_until
+    `, workerID, leaseSeconds).Scan(
+		&job.ID,
+		&job.Type,
+		&job.A,
+		&job.B,
+		&job.Status,
+		&job.Result,
+		&job.Retries,
+		&job.WorkerID,
+		&job.Attempt,
+		&job.LeaseUntil,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Job{}, false, nil
+	}
+	if err != nil {
+		return Job{}, false, fmt.Errorf("claim next job: %w", err)
+	}
 
 	return job, true, nil
+}
+
+func (s *JobStore) CreateContext(ctx context.Context, job Job) error {
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO jobs (id, type, a, b, status, result, retries, worker_id, attempt, lease_until)
+		VALUES ($1, $2, $3, $4, 'queued', NULL, 0, NULL, 0, NULL)
+	`, job.ID, job.Type, job.A, job.B)
+	if err != nil {
+		return fmt.Errorf("create job: %w", err)
+	}
+	return nil
+}
+
+func (s *JobStore) GetContext(ctx context.Context, id string) (Job, bool, error) {
+	var job Job
+	var workerID pgtype.Text
+	var leaseUntil pgtype.Timestamptz
+	err := s.db.QueryRow(ctx, `
+		SELECT id, type, a, b, status, COALESCE(result, 0), retries,
+		       worker_id, attempt, lease_until
+		FROM jobs WHERE id = $1
+	`, id).Scan(&job.ID, &job.Type, &job.A, &job.B, &job.Status,
+		&job.Result, &job.Retries, &workerID, &job.Attempt, &leaseUntil)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Job{}, false, nil
+	}
+	if err != nil {
+		return Job{}, false, fmt.Errorf("get job: %w", err)
+	}
+	if workerID.Valid {
+		job.WorkerID = workerID.String
+	}
+	if leaseUntil.Valid {
+		job.LeaseUntil = leaseUntil.Time
+	}
+	return job, true, nil
+}
+
+func (s *JobStore) RenewLeaseContext(ctx context.Context, id, workerID string, attempt int, duration time.Duration) (bool, error) {
+	seconds := int(duration.Seconds())
+	if seconds < 1 {
+		return false, fmt.Errorf("lease duration must be at least one second")
+	}
+	tag, err := s.db.Exec(ctx, `
+		UPDATE jobs SET lease_until = NOW() + ($1::integer * INTERVAL '1 second')
+		WHERE id = $2 AND status = 'processing' AND worker_id = $3
+		  AND attempt = $4 AND lease_until > NOW()
+	`, seconds, id, workerID, attempt)
+	if err != nil {
+		return false, fmt.Errorf("renew lease: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (s *JobStore) CompleteContext(ctx context.Context, id, workerID string, attempt, result int) (bool, error) {
+	tag, err := s.db.Exec(ctx, `
+		UPDATE jobs SET status = 'completed', result = $1,
+			worker_id = NULL, lease_until = NULL
+		WHERE id = $2 AND status = 'processing' AND worker_id = $3
+		  AND attempt = $4 AND lease_until > NOW()
+	`, result, id, workerID, attempt)
+	if err != nil {
+		return false, fmt.Errorf("complete job: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// FailAttempt atomically transitions the current owned attempt to queued or failed.
+// A stale worker cannot alter a newer attempt because owner and attempt are fenced.
+func (s *JobStore) FailAttempt(ctx context.Context, id, workerID string, attempt, retryLimit int) (bool, error) {
+	tag, err := s.db.Exec(ctx, `
+		UPDATE jobs SET
+			status = CASE WHEN retries + 1 >= $1 THEN 'failed' ELSE 'queued' END,
+			retries = retries + 1, worker_id = NULL, lease_until = NULL
+		WHERE id = $2 AND status = 'processing' AND worker_id = $3
+		  AND attempt = $4 AND lease_until > NOW()
+	`, retryLimit, id, workerID, attempt)
+	if err != nil {
+		return false, fmt.Errorf("fail job attempt: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// RecoverExpired atomically recovers every expired processing lease. Repeated
+// recovery loops and multiple server instances are safe because each update is conditional.
+func (s *JobStore) RecoverExpired(ctx context.Context, retryLimit int) error {
+	_, err := s.db.Exec(ctx, `
+		UPDATE jobs SET
+			status = CASE WHEN retries + 1 >= $1 THEN 'failed' ELSE 'queued' END,
+			retries = retries + 1, worker_id = NULL, lease_until = NULL
+		WHERE status = 'processing' AND lease_until <= NOW()
+	`, retryLimit)
+	if err != nil {
+		return fmt.Errorf("recover expired jobs: %w", err)
+	}
+	return nil
 }

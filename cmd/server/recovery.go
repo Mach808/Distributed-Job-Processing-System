@@ -1,48 +1,27 @@
 package main
 
 import (
-	"fmt"
+	"context"
+	"log"
 	"time"
 )
 
-const recoveryInterval = 5 * time.Second
+const recoveryInterval = 2 * time.Second
 
-func startRecovery(store *JobStore, queue *Queue) {
-	fmt.Println("Recovery system started")
-
+// startRecovery atomically recovers expired leases in PostgreSQL. Recovered queued
+// jobs become visible to all workers automatically; no local queue is involved.
+func startRecovery(ctx context.Context, store *JobStore) {
+	log.Println("lease recovery started")
+	ticker := time.NewTicker(recoveryInterval)
+	defer ticker.Stop()
 	for {
-		time.Sleep(recoveryInterval)
-
-		fmt.Println("Recovery check running")
-
-		jobs := store.GetAll()
-
-		for _, job := range jobs {
-			if job.Status != "processing" {
-				continue
-			}
-			recoveredJob, recovered, err := store.Recover(job.ID)
-
-			if err != nil {
-				fmt.Println("Recovery failed:", err)
-				continue
-			}
-			if recovered {
-				fmt.Println(
-					"Recovered job:",
-					recoveredJob.ID,
-					"Status:",
-					recoveredJob.Status,
-					"Retries:",
-					recoveredJob.Retries,
-				)
-
-				if recoveredJob.Status == "queued" {
-					queue.Enqueue(recoveredJob)
-				} else if recoveredJob.Status == "failed" {
-					fmt.Println("Job permanently failed:", recoveredJob.ID)
-				}
-			}
+		if err := store.RecoverExpired(ctx, maxRetries); err != nil {
+			log.Printf("lease recovery failed: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
 }
