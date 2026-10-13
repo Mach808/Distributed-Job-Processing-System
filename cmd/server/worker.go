@@ -14,12 +14,13 @@ const (
 )
 
 type Worker struct {
-	ID    string
-	store *JobStore
+	ID      string
+	store   *JobStore
+	execute func(Job) (int, error)
 }
 
 func NewWorker(id string, store *JobStore) *Worker {
-	return &Worker{ID: id, store: store}
+	return &Worker{ID: id, store: store, execute: executeJob}
 }
 
 // Start continuously claims jobs from PostgreSQL. The database is the only queue;
@@ -77,8 +78,12 @@ func (w *Worker) process(parent context.Context, job Job) {
 		}
 	}()
 
+	execute := w.execute
+	if execute == nil {
+		execute = executeJob
+	}
 	result, err := runJobSafely(func() (int, error) {
-		return executeJob(job)
+		return execute(job)
 	})
 	cancel()
 	<-heartbeatDone

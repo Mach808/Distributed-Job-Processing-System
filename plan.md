@@ -47,7 +47,7 @@ For a private proof of concept, start with one EC2 instance and a non-production
 
 ### Optional supporting resource
 
-Create a private S3 bucket if releases or database exports need durable storage. Block public access, enable encryption and versioning, scope instance access to a release prefix, and define lifecycle/retention rules. S3 is not in the job read/write path. The embedded dashboard is delivered by the server binary.
+Create a private S3 bucket if releases or database exports need durable storage. Block public access, enable encryption and versioning, scope instance access to specific prefixes, and define lifecycle/retention rules. S3 is not in the current job read/write path; it would become part of that path if file-processing job types are implemented. The embedded dashboard is delivered by the server binary.
 
 Use Terraform or CloudFormation to define the VPC, subnets, security groups, database, load balancer, instance profile, launch template, Auto Scaling group, alarms, and bucket policy. Keep infrastructure changes reviewed and repeatable; do not build production infrastructure only through undocumented console clicks.
 
@@ -65,6 +65,15 @@ Complete these code changes before public exposure:
 8. **Database migrations:** move the README schema into versioned SQL migrations and run migrations as a controlled deployment step, once per release, before new app instances become healthy. Do not let every application instance race to apply schema changes at startup. Use a restricted runtime database user that has only the permissions needed by the application.
 
 Record that `failed` jobs currently expose status/retry data but not a durable failure message; decide whether storing a safe failure reason is required for operations.
+
+### Possible richer job types for the project
+
+The current addition and multiplication jobs are small demonstrations. These are useful next job types because they exercise longer-running work, validation, retries, and durable artifacts. They are **proposals, not implemented features**:
+
+1. **Image processing:** accept an image from a private S3 input location, validate its format and size, generate a resized image and thumbnail (or convert it to a selected format), then store the outputs and dimensions/file sizes in S3 and the job result. Keep input and output object keys in the job payload/result; avoid storing image bytes in PostgreSQL. Set upload and output size limits, and use generated object keys rather than trusting user-supplied paths.
+2. **Log analysis:** accept a log file from a private S3 input location, parse records, count errors by severity/time window, and produce a summary report (for example JSON or CSV) in S3. Return summary counts and the report object key through job status. Define supported formats and malformed-line behavior, and cap file size and processing time.
+
+Both features need an API contract for submitting an input object reference and selecting options, authorization preventing users from reading or overwriting another user's objects, and a result schema that can represent structured data plus artifact references. Add S3 IAM permissions scoped separately to input and output prefixes. Upload files directly to S3 (for example through short-lived presigned URLs) rather than sending large bodies through the job API. PostgreSQL remains the source of truth for job state and coordination; S3 holds the file artifacts. Implement these only after the base deployment hardening, and add focused tests for parsing/transformation, failure/retry behavior, and object access without requiring production AWS resources.
 
 ## 5. Database provisioning and configuration
 
@@ -116,7 +125,7 @@ postgres://<runtime-user>:<encoded-password>@<rds-endpoint>:5432/<database>?sslm
 - Add an ALB and Auto Scaling group when HTTP availability or multi-instance deployment is needed. AWS Auto Scaling can register/deregister instances with an attached target group and can use load-balancer health checks to replace unhealthy instances.
 - ALB request count alone may not represent background queue pressure. Before automatic worker scaling, measure queued-job count, oldest queued-job age, processing count, expired leases, failure/retry rate, and RDS load. Publish deliberate CloudWatch custom metrics or use a private monitoring query; the application currently exposes no metrics endpoint.
 - Scale the application and worker count while watching RDS CPU, storage, connections, query latency, and lock contention. Consider RDS Proxy only if measured connection churn/connection volume justifies another component; it is not required for the initial deployment.
-- Keep RDS backups and S3 artifact retention independent. S3 can store exports, but database restore should use RDS snapshots/automated backups unless a separate export workflow is deliberately designed.
+- Keep RDS backups and S3 artifact retention independent. S3 can store exports and, if the proposed file-processing jobs are implemented, their input/output artifacts. Database restore should use RDS snapshots/automated backups unless a separate export workflow is deliberately designed.
 - Maintain tested procedures for OS patching, Go releases, secret rotation, certificate renewal, database upgrades, incident response, and rollback.
 
 ## 9. Cost and capacity controls

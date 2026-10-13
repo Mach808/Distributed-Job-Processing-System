@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 //go:embed dashboard
 var dashboardFiles embed.FS
 
+const shutdownDeadline = 15 * time.Second
+
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found; using environment variables")
@@ -27,17 +30,25 @@ func main() {
 	if err != nil {
 		log.Fatalf("database connection failed: %v", err)
 	}
-	defer db.Close()
 	log.Println("connected to PostgreSQL")
 
 	store := NewJobStore(db)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	var background sync.WaitGroup
 	for i := 0; i < 3; i++ {
 		worker := NewWorker(fmt.Sprintf("worker-%d", i+1), store)
-		go worker.Start(ctx)
+		background.Add(1)
+		go func() {
+			defer background.Done()
+			worker.Start(ctx)
+		}()
 	}
-	go startRecovery(ctx, store)
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		startRecovery(ctx, store)
+	}()
 
 	mux := http.NewServeMux()
 	handler := NewHandler(store)
@@ -54,17 +65,49 @@ func main() {
 		port = "8080"
 	}
 	server := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+	log.Printf("server listening on port %s", port)
+	serveResult := make(chan error, 1)
+	go func() { serveResult <- server.ListenAndServe() }()
+	select {
+	case <-ctx.Done():
+		// Stop accepting requests and drain handlers before canceling workers.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownDeadline)
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("HTTP shutdown: %v", err)
+			_ = server.Close()
 		}
+		shutdownCancel()
+	case err := <-serveResult:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP server failed: %v", err)
+		}
+	}
+	stop()
+	// If the listener failed independently, close any remaining HTTP handlers.
+	_ = server.Close()
+	backgroundCtx, backgroundCancel := context.WithTimeout(context.Background(), shutdownDeadline)
+	if !waitForBackground(&background, backgroundCtx.Done()) {
+		log.Printf("background shutdown exceeded %s; waiting for database users to exit before closing PostgreSQL", shutdownDeadline)
+		background.Wait()
+	}
+	backgroundCancel()
+	db.Close()
+}
+
+// waitForBackground waits for all registered background goroutines until the
+// shutdown deadline. On timeout, callers must still ensure DB users have exited
+// before closing their shared pool.
+func waitForBackground(background *sync.WaitGroup, deadline <-chan struct{}) bool {
+	done := make(chan struct{})
+	go func() {
+		background.Wait()
+		close(done)
 	}()
-	log.Printf("server listening on port %s", port)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("HTTP server failed: %v", err)
+	select {
+	case <-done:
+		return true
+	case <-deadline:
+		return false
 	}
 }
 
