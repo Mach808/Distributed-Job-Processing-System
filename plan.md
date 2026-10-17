@@ -2,7 +2,7 @@
 
 ## 1. Goal and deployment shape
 
-Deploy the existing Go service on Amazon EC2 and use PostgreSQL for the durable job store and shared work queue. Use **Amazon RDS for PostgreSQL** as the default AWS database choice. Amazon S3 is object storage; it is suitable for versioned release artifacts, exports, or archived files, but it cannot replace the live PostgreSQL database. The dashboard is embedded in the Go binary, so it does not need S3 or a CDN.
+Deploy the Go service from `backend/` on Amazon EC2 and use PostgreSQL for the durable job store and shared work queue. Use **Amazon RDS for PostgreSQL** as the default AWS database choice. Amazon S3 is object storage; it is suitable for versioned release artifacts, exports, or archived files, but it cannot replace the live PostgreSQL database. The dashboard is stored in the root `website/` directory and must be deployed alongside the server binary; it does not need S3 or a CDN.
 
 Production target:
 
@@ -20,14 +20,14 @@ For a private proof of concept, start with one EC2 instance and a non-production
 
 ## 2. Current application facts and constraints
 
-- `cmd/server/main.go` starts an HTTP server, three workers, and a PostgreSQL lease recovery loop in every process.
-- `POST /jobs` accepts job requests; `GET /jobs/{id}` reads status. The embedded dashboard is served at `/`.
+- `backend/cmd/server/main.go` starts an HTTP server, three workers, and a PostgreSQL lease recovery loop in every process.
+- `POST /jobs` accepts job requests; `GET /jobs/{id}` reads status. The dashboard in `website/` is served from disk at `/` (configure `WEBSITE_DIR` when its relative location differs).
 - `DATABASE_URL` is required; `PORT` is optional and defaults to `8080`.
 - `README.md` documents the `jobs` table and its queued-job and expired-lease indexes. The application does not run schema migrations on startup.
 - The service has no dedicated liveness/readiness endpoint, authentication, or metrics endpoint. `/` serving the dashboard does not prove PostgreSQL is reachable.
 - Worker IDs currently repeat as `worker-1`, `worker-2`, and `worker-3` on every EC2 instance. Job attempt fencing protects ownership, but repeated IDs make logs and active-job attribution ambiguous.
 - Job IDs are currently generated from `time.Now().UnixNano()`. Replace this with a collision-resistant ID generator before relying on concurrent public submission.
-- Tests in `cmd/server` load the developer `.env` and use PostgreSQL. CI and pre-release tests must use a separate disposable test database, never the production database.
+- Tests in `backend/cmd/server` load `backend/.env` and use PostgreSQL. CI and pre-release tests must use a separate disposable test database, never the production database.
 - The repository currently has no EC2 service unit, container image, CI release pipeline, or AWS infrastructure-as-code configuration.
 
 ## 3. AWS resources
@@ -47,7 +47,7 @@ For a private proof of concept, start with one EC2 instance and a non-production
 
 ### Optional supporting resource
 
-Create a private S3 bucket if releases or database exports need durable storage. Block public access, enable encryption and versioning, scope instance access to specific prefixes, and define lifecycle/retention rules. S3 is not in the current job read/write path; it would become part of that path if file-processing job types are implemented. The embedded dashboard is delivered by the server binary.
+Create a private S3 bucket if releases or database exports need durable storage. Block public access, enable encryption and versioning, scope instance access to specific prefixes, and define lifecycle/retention rules. S3 is not in the current job read/write path; it would become part of that path if file-processing job types are implemented. Deploy the `website/` directory beside the backend release and set `WEBSITE_DIR` if needed.
 
 Use Terraform or CloudFormation to define the VPC, subnets, security groups, database, load balancer, instance profile, launch template, Auto Scaling group, alarms, and bucket policy. Keep infrastructure changes reviewed and repeatable; do not build production infrastructure only through undocumented console clicks.
 
@@ -93,7 +93,7 @@ postgres://<runtime-user>:<encoded-password>@<rds-endpoint>:5432/<database>?sslm
 
 ## 6. Build and instance setup
 
-1. Build and test in CI using the Go version required by `go.mod` (`go 1.27.1`). Build for the target EC2 architecture; for x86-64:
+1. Build and test in CI from `backend/` using the Go version required by `backend/go.mod` (`go 1.27.1`). Build for the target EC2 architecture; for x86-64:
 
    ```sh
    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o job-server ./cmd/server
@@ -103,7 +103,7 @@ postgres://<runtime-user>:<encoded-password>@<rds-endpoint>:5432/<database>?sslm
 2. Run the unit and integration suite against an isolated PostgreSQL service. Update tests so they use a clearly named test `DATABASE_URL` and do not require or silently load a developer `.env` file. Include the multi-instance scenario: unique submissions, exactly one accepted claim per attempt, completion, retries, expired lease recovery, and SIGTERM shutdown.
 3. Publish a versioned binary and checksum to a private release location (S3 is suitable) or bake it into a reviewed AMI. Keep the binary, migration version, and source revision associated with each release.
 4. Configure EC2 with a supported Linux image, patched packages, minimal EBS storage, time synchronization, and the instance profile. Store no job state on EBS; PostgreSQL is authoritative.
-5. Install a `systemd` unit (or equivalent supervisor) that starts the binary on boot, supplies `PORT=8080` and `DATABASE_URL`, restarts on unexpected exit, sends SIGTERM on stop, and writes stdout/stderr to journald/CloudWatch. Set `TimeoutStopSec` longer than the application's graceful shutdown window and verify shutdown under active work.
+5. Install a `systemd` unit (or equivalent supervisor) that starts the binary on boot with `WorkingDirectory` set to the deployed `backend/` directory, supplies `PORT=8080`, `DATABASE_URL`, and (if needed) `WEBSITE_DIR` pointing to the deployed `website/` directory, restarts on unexpected exit, sends SIGTERM on stop, and writes stdout/stderr to journald/CloudWatch. Set `TimeoutStopSec` longer than the application's graceful shutdown window and verify shutdown under active work.
 6. Use SSM Session Manager for administration. Restrict operator IAM permissions and record administrative changes.
 
 ## 7. Deployment sequence

@@ -1,6 +1,6 @@
 # Distributed Job System
 
-A Go service that accepts jobs over HTTP, stores them in PostgreSQL, and processes them with a pool of background workers. PostgreSQL is both the durable job store and the work queue. The web dashboard is embedded in the server binary and served from `/`.
+A Go service that accepts jobs over HTTP, stores them in PostgreSQL, and processes them with a pool of background workers. PostgreSQL is both the durable job store and the work queue. The web dashboard lives in the root `website/` directory and is served from `/` by the Go server.
 
 ## Requirements
 
@@ -17,6 +17,7 @@ CREATE TABLE jobs (
     type        TEXT NOT NULL,
     a           INTEGER NOT NULL,
     b           INTEGER NOT NULL,
+    input_path  TEXT,
     status      TEXT NOT NULL CHECK (status IN ('queued', 'processing', 'completed', 'failed')),
     result      INTEGER,
     retries     INTEGER NOT NULL DEFAULT 0,
@@ -35,13 +36,14 @@ Set `DATABASE_URL` to a PostgreSQL connection string. For example:
 export DATABASE_URL='postgres://postgres:password@localhost:5432/jobs?sslmode=disable'
 ```
 
-The server also loads variables from a `.env` file in its working directory when present. `DATABASE_URL` is required. `PORT` is optional and defaults to `8080`.
+The server loads variables from `backend/.env` when started with `backend/` as its working directory. `DATABASE_URL` is required. `PORT` is optional and defaults to `8080`. The dashboard files live in the root `website/` directory; set `WEBSITE_DIR` if the server cannot resolve that directory from its working directory.
 
 ## Run
 
 From the repository root:
 
 ```sh
+cd backend
 go run ./cmd/server
 ```
 
@@ -51,7 +53,9 @@ Open [http://localhost:8080](http://localhost:8080) to use the dashboard. The se
 
 ### Create a job
 
-`POST /jobs` accepts a JSON object with a `type` and integer operands `a` and `b`:
+`POST /jobs` accepts a JSON object with a `type`. Numeric jobs use integer
+operands `a` and `b`; local file jobs use `input_path`, and CSV searches also
+use `query`:
 
 ```sh
 curl -i http://localhost:8080/jobs \
@@ -61,15 +65,25 @@ curl -i http://localhost:8080/jobs \
 
 On success, the API returns `201 Created` and the job record, including its generated ID and initial `queued` status. Supported job types:
 
-| Type | Behavior |
-| --- | --- |
-| `addition` | Adds `a` and `b`. |
-| `subtraction` | Subtracts `b` from `a`. |
-| `multiplication` | Multiplies `a` and `b`. |
-| `division` | Integer-divides `a` by `b`; `b` must be nonzero. |
-| `fibonacci` | Returns Fibonacci number `a`; `a` must be from 0 through 46. |
-| `prime_count` | Counts primes up to `a`; `a` must be from 2 through 10,000,000. |
-| `retry_demo` | Fails for the first `a` attempts, then returns `b`; `a` must be from 0 through 2. |
+| Type | Description | Inputs | Result |
+| --- | --- | --- | --- |
+| `addition` | Adds two numbers. | `a`, `b` | `a + b` |
+| `subtraction` | Subtracts the second number from the first. | `a`, `b` | `a - b` |
+| `multiplication` | Multiplies two numbers. | `a`, `b` | `a × b` |
+| `division` | Performs integer division; `b` must be nonzero. | `a`, `b` | `a / b` |
+| `fibonacci` | Calculates a Fibonacci number; `a` must be 0–46. | `a` | Fibonacci value |
+| `prime_count` | Counts primes up to `a`; `a` must be 2–10,000,000. | `a` | Prime count |
+| `retry_demo` | Fails for the first `a` attempts, then succeeds. | `a` retries, `b` result | `b` |
+| `image_processing` | Validates a local image file. | `input_path` | File size in bytes |
+| `log_analysis` | Counts lines containing `ERROR`. | `input_path` | Error-line count |
+| `csv_processing` | Counts exact cell matches for a value. | `input_path`, `query` | Match count |
+
+Local file jobs read only from `JOB_DATA_DIR` (default `data/jobs`). Apply
+`backend/migrations/001_local_job_inputs.sql`, place the input file below that
+directory, and submit its relative path in `input_path`. Paths outside the
+configured directory are rejected.
+
+Apply `backend/migrations/002_csv_query.sql` for CSV value searching.
 
 Unknown fields, malformed JSON, unsupported job types, and invalid inputs return `400 Bad Request`.
 
@@ -87,6 +101,10 @@ Jobs move through `queued`, `processing`, and either `completed` or `failed`. Wo
 
 ## Project layout
 
-- `cmd/server/` — HTTP server, PostgreSQL job store, workers, recovery loop, and dashboard assets.
-- `channel_ex.go` — standalone channel example.
+- `backend/` — Go module, HTTP server, PostgreSQL job store, workers, recovery loop, and standalone channel example.
+- `website/` — dashboard HTML, CSS, and vanilla JavaScript served by the Go server from disk.
+- `mobile/` — reserved for the planned mobile frontend.
+- `plan.md` — AWS deployment plan and proposed file-processing job types.
+
+Run backend tests from the backend directory with `go test ./...`.
 
