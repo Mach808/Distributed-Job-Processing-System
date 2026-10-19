@@ -32,7 +32,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var background sync.WaitGroup
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 10; i++ {
 		worker := NewWorker(fmt.Sprintf("worker-%d", i+1), store)
 		background.Add(1)
 		go func() {
