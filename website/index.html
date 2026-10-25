@@ -38,6 +38,21 @@
 
       <div class="workspace">
         <aside class="sidebar">
+          <section class="panel access-panel">
+            <div class="panel-heading">
+              <div><p class="eyebrow">ACCOUNT ACCESS</p><h2>Sign in</h2></div>
+              <span class="heading-icon heading-icon-muted" aria-hidden="true">&#128274;</span>
+            </div>
+            <form id="login-form">
+              <label for="login-username">Username</label>
+              <input id="login-username" type="text" autocomplete="username" required>
+              <label for="login-password">Password</label>
+              <input id="login-password" type="password" autocomplete="current-password" required>
+              <button class="button button-primary" type="submit"><span>Sign in</span><span aria-hidden="true">&#8594;</span></button>
+              <p class="form-message" id="login-message" role="status" aria-live="polite"></p>
+            </form>
+            <button class="text-button logout-button" id="logout-button" type="button" hidden>Sign out</button>
+          </section>
           <section class="panel submit-panel">
             <div class="panel-heading">
               <div><p class="eyebrow">NEW TASK</p><h2>Submit a job</h2></div>

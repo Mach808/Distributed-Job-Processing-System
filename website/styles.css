@@ -50,6 +50,11 @@ h1 { margin: 0; font-size: 30px; font-weight: 600; letter-spacing: -.055em; line
 .workspace { display: grid; grid-template-columns: minmax(270px, 320px) minmax(0, 1fr); align-items: start; gap: 18px; }
 .sidebar { display: grid; gap: 14px; }
 .panel { border: 1px solid var(--line); border-radius: 11px; background: var(--paper); }
+.access-panel { padding: 21px; }
+.access-panel .panel-heading { margin-bottom: 18px; }
+.access-panel input + label { margin-top: 13px; }
+.access-panel .button-primary { margin-top: 16px; }
+.logout-button { margin-top: 9px; }
 .submit-panel, .lookup-panel { padding: 21px; }
 .panel-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 22px; }
 .panel-heading .eyebrow { margin-bottom: 6px; }

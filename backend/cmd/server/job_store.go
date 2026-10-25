@@ -19,6 +19,107 @@ func NewJobStore(db *pgxpool.Pool) *JobStore {
 	return &JobStore{db: db}
 }
 
+// AuthenticateAPIKey validates an API key and returns its client identity.
+// Invalid, inactive, and expired keys are reported as authenticated=false
+// without exposing which condition caused the rejection.
+func (s *JobStore) AuthenticateAPIKey(ctx context.Context, apiKey string) (string, bool, error) {
+	var clientID string
+	hashedKey := hashAPIKey(apiKey)
+
+	err := s.db.QueryRow(ctx, `
+		SELECT client_id
+		FROM api_clients
+		WHERE key_hash = $1
+		  AND active = TRUE
+		  AND (expires_at IS NULL OR expires_at > NOW())
+	`, hashedKey).Scan(&clientID)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("authenticate API key: %w", err)
+	}
+
+	return clientID, true, nil
+}
+
+func (s *JobStore) CreateAPIClient(ctx context.Context, clientID, keyHash string) error {
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO api_clients (client_id, key_hash)
+		VALUES ($1, $2)
+	`, clientID, keyHash)
+	if err != nil {
+		return fmt.Errorf("create API client: %w", err)
+	}
+	return nil
+}
+
+func (s *JobStore) CreateUser(ctx context.Context, username, passwordHash, clientID string) error {
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO users (username, password_hash, client_id)
+		VALUES ($1, $2, $3)
+	`, username, passwordHash, clientID)
+	if err != nil {
+		return fmt.Errorf("create user: %w", err)
+	}
+	return nil
+}
+
+func (s *JobStore) AuthenticateUser(ctx context.Context, username, password string) (string, bool, error) {
+	var passwordHash, clientID string
+	err := s.db.QueryRow(ctx, `
+		SELECT password_hash, client_id
+		FROM users
+		WHERE username = $1 AND active = TRUE
+	`, username).Scan(&passwordHash, &clientID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("authenticate user: %w", err)
+	}
+	if !verifyPassword(password, passwordHash) {
+		return "", false, nil
+	}
+	return clientID, true, nil
+}
+
+func (s *JobStore) CreateSession(ctx context.Context, tokenHash, clientID string, expiresAt time.Time) error {
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO sessions (token_hash, client_id, expires_at)
+		VALUES ($1, $2, $3)
+	`, tokenHash, clientID, expiresAt)
+	if err != nil {
+		return fmt.Errorf("create session: %w", err)
+	}
+	return nil
+}
+
+func (s *JobStore) AuthenticateSession(ctx context.Context, tokenHash string) (string, bool, error) {
+	var clientID string
+	err := s.db.QueryRow(ctx, `
+		SELECT client_id
+		FROM sessions
+		WHERE token_hash = $1 AND expires_at > NOW()
+	`, tokenHash).Scan(&clientID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("authenticate session: %w", err)
+	}
+	return clientID, true, nil
+}
+
+func (s *JobStore) DeleteSession(ctx context.Context, tokenHash string) error {
+	_, err := s.db.Exec(ctx, `DELETE FROM sessions WHERE token_hash = $1`, tokenHash)
+	if err != nil {
+		return fmt.Errorf("delete session: %w", err)
+	}
+	return nil
+}
+
 func (s *JobStore) Get(id string) (Job, bool) {
 	var job Job
 	var workerID pgtype.Text

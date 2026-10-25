@@ -47,7 +47,11 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
-	handler := NewHandler(store)
+	handler := NewHandler(store, os.Getenv("ADMIN_API_KEY"))
+	mux.HandleFunc("POST /admin/clients", handler.CreateAPIClient)
+	mux.HandleFunc("POST /admin/users", handler.CreateUser)
+	mux.HandleFunc("POST /login", handler.Login)
+	mux.HandleFunc("POST /logout", handler.Logout)
 	mux.HandleFunc("POST /jobs", handler.CreateJob)
 	mux.HandleFunc("GET /jobs", handler.ListJobs)
 	mux.HandleFunc("GET /jobs/{id}", handler.GetJob)

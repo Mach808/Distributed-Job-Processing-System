@@ -15,6 +15,11 @@
   let refreshing = false;
 
   const elements = {
+    loginForm: document.querySelector('#login-form'),
+    loginUsername: document.querySelector('#login-username'),
+    loginPassword: document.querySelector('#login-password'),
+    loginMessage: document.querySelector('#login-message'),
+    logoutButton: document.querySelector('#logout-button'),
     form: document.querySelector('#job-form'),
     type: document.querySelector('#job-type'),
     operator: document.querySelector('#operator'),
@@ -75,6 +80,7 @@
   async function createJob(body) {
     const response = await fetch('/jobs', {
       method: 'POST',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(body),
     });
@@ -87,6 +93,7 @@
 
   async function requestJob(id) {
     const response = await fetch(`/jobs/${encodeURIComponent(id)}`, {
+      credentials: 'same-origin',
       headers: { Accept: 'application/json' },
     });
     if (!response.ok) {
@@ -98,6 +105,7 @@
 
   async function requestJobs() {
     const response = await fetch('/jobs', {
+      credentials: 'same-origin',
       headers: { Accept: 'application/json' },
     });
     if (!response.ok) {
@@ -254,6 +262,39 @@
     elements.operator.textContent = type.operator;
     elements.help.textContent = type.help;
     document.querySelector('#file-job-fields').hidden = elements.type.value !== 'csv_processing';
+  });
+
+  elements.loginForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    elements.loginMessage.className = 'form-message';
+    elements.loginMessage.textContent = 'Signing in…';
+    try {
+      const response = await fetch('/login', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          username: elements.loginUsername.value.trim(),
+          password: elements.loginPassword.value,
+        }),
+      });
+      if (!response.ok) throw new Error((await response.text()).trim() || `Request failed (${response.status})`);
+      elements.loginMessage.textContent = 'Signed in';
+      elements.logoutButton.hidden = false;
+      await refreshJobs();
+    } catch (error) {
+      elements.loginMessage.className = 'form-message error';
+      elements.loginMessage.textContent = error.message;
+    }
+  });
+
+  elements.logoutButton.addEventListener('click', async () => {
+    await fetch('/logout', { method: 'POST', credentials: 'same-origin' });
+    elements.logoutButton.hidden = true;
+    elements.loginMessage.className = 'form-message';
+    elements.loginMessage.textContent = 'Signed out';
+    records.clear();
+    render();
   });
 
   elements.form.addEventListener('submit', async (event) => {
