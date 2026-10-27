@@ -9,6 +9,8 @@
     fibonacci: { label: 'Fibonacci number', operator: 'index', help: 'Computes Fibonacci(A), where A is from 0 to 46. B is ignored.' },
     prime_count: { label: 'Count primes', operator: '≤', help: 'Counts primes up to A (2 to 10,000,000). B is ignored.' },
     retry_demo: { label: 'Retry demonstration', operator: 'retries', help: 'Fails A times, then completes with B. Set A from 0 to 2 to see retries.' },
+    image_processing: { label: 'Image processing', operator: 'file', help: 'Validates the bundled sample image.' },
+    log_analysis: { label: 'Log analysis', operator: 'ERRORs', help: 'Counts ERROR lines in the bundled sample log.' },
     csv_processing: { label: 'Search CSV value', operator: 'count', help: 'Counts exact cell matches in a local CSV file.' },
   };
   const records = new Map();
@@ -74,6 +76,9 @@
     if (type === 'fibonacci') a = randomInt(0, 46);
     if (type === 'prime_count') a = randomInt(2, 10000000);
     if (type === 'retry_demo') a = randomInt(0, 2);
+    if (type === 'image_processing') return { type, input_path: 'sample.png' };
+    if (type === 'log_analysis') return { type, input_path: 'sample.log' };
+    if (type === 'csv_processing') return { type, input_path: 'sample.csv', query: 'Ada' };
     return { type, a, b };
   }
 
@@ -261,7 +266,9 @@
     const type = jobTypes[elements.type.value];
     elements.operator.textContent = type.operator;
     elements.help.textContent = type.help;
-    document.querySelector('#file-job-fields').hidden = elements.type.value !== 'csv_processing';
+    document.querySelector('#file-job-fields').hidden = !['image_processing', 'log_analysis', 'csv_processing'].includes(elements.type.value);
+    document.querySelector('#csv-query-field').hidden = elements.type.value !== 'csv_processing';
+    document.querySelector('#number-fields').hidden = ['image_processing', 'log_analysis', 'csv_processing'].includes(elements.type.value);
   });
 
   elements.loginForm.addEventListener('submit', async (event) => {
@@ -306,8 +313,10 @@
       a: Number(data.get('a')),
       b: Number(data.get('b')),
     };
-      if (body.type === 'csv_processing') {
+      if (['image_processing', 'log_analysis', 'csv_processing'].includes(body.type)) {
         body.input_path = String(data.get('input_path') || '').trim();
+      }
+      if (body.type === 'csv_processing') {
         body.query = String(data.get('query') || '');
       }
     submit.disabled = true;

@@ -68,10 +68,12 @@
                 <option value="fibonacci">Fibonacci number</option>
                 <option value="prime_count">Count primes</option>
                 <option value="retry_demo">Retry demonstration</option>
+                <option value="image_processing">Image processing</option>
+                <option value="log_analysis">Log analysis</option>
                 <option value="csv_processing">Search CSV value</option>
               </select>
               <p class="helper-text" id="job-help">Adds the two numbers and returns the sum.</p>
-              <div class="number-fields">
+              <div class="number-fields" id="number-fields">
                 <div><label for="number-a">First number</label><input id="number-a" name="a" type="number" step="1" value="12" required></div>
                 <span class="operator" id="operator">+</span>
                 <div><label for="number-b">Second number</label><input id="number-b" name="b" type="number" step="1" value="8" required></div>
@@ -79,8 +81,10 @@
               <div class="file-job-fields" id="file-job-fields" hidden>
                 <label for="input-path">Local input file</label>
                 <input id="input-path" name="input_path" type="text" value="sample.csv" placeholder="sample.csv">
-                <label for="query-value">Value to count</label>
-                <input id="query-value" name="query" type="text" value="Ada" placeholder="Ada">
+                <div id="csv-query-field">
+                  <label for="query-value">Value to count</label>
+                  <input id="query-value" name="query" type="text" value="Ada" placeholder="Ada">
+                </div>
               </div>
               <button class="button button-primary" type="submit"><span>Submit job</span><span aria-hidden="true">→</span></button>
               <div class="batch-control">
