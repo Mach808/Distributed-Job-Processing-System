@@ -4,3 +4,9 @@ values:
     value: ''
   - key: baseUrl
     value: ''
+  - key: load-balancing-client-1
+    value: ''
+  - key: load-balancing-client-2
+    value: ''
+  - key: load-balancing-client-3
+    value: ''
