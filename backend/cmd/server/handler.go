@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -223,7 +224,7 @@ func (h *Handler) authenticateRequest(r *http.Request) (string, bool, error) {
 }
 
 func (h *Handler) CreateJob(w http.ResponseWriter, r *http.Request) {
-	_, authenticated, err := h.authenticateRequest(r)
+	clientID, authenticated, err := h.authenticateRequest(r)
 	if err != nil {
 		log.Printf("authenticate request: %v", err)
 		http.Error(w, "authentication service unavailable", http.StatusInternalServerError)
@@ -277,9 +278,17 @@ func (h *Handler) CreateJob(w http.ResponseWriter, r *http.Request) {
 		Status:    "queued",
 	}
 
-	if err := h.store.CreateContext(r.Context(), job); err != nil {
+	decision, err := h.store.CreateRateLimited(r.Context(), clientID, job, time.Now().UTC())
+	if err != nil {
 		log.Printf("create job: %v", err)
 		http.Error(w, "Failed to create job", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("X-RateLimit-Limit", formatRateLimitNumber(decision.Capacity))
+	w.Header().Set("X-RateLimit-Remaining", formatRateLimitNumber(decision.RemainingTokens))
+	if !decision.Allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(decision.RetryAfterSecond))
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 

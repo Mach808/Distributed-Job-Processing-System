@@ -1,0 +1,6 @@
+name: New Environment
+values:
+  - key: baseUrlAdmin
+    value: ''
+  - key: baseUrl
+    value: ''

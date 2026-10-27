@@ -54,7 +54,6 @@ func (s *JobStore) CreateAPIClient(ctx context.Context, clientID, keyHash string
 	}
 	return nil
 }
-
 func (s *JobStore) CreateUser(ctx context.Context, username, passwordHash, clientID string) error {
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO users (username, password_hash, client_id)
@@ -65,7 +64,6 @@ func (s *JobStore) CreateUser(ctx context.Context, username, passwordHash, clien
 	}
 	return nil
 }
-
 func (s *JobStore) AuthenticateUser(ctx context.Context, username, password string) (string, bool, error) {
 	var passwordHash, clientID string
 	err := s.db.QueryRow(ctx, `
@@ -697,3 +695,5 @@ func (s *JobStore) RecoverExpired(ctx context.Context, retryLimit int) error {
 	}
 	return nil
 }
+
+
