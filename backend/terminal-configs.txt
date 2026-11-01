@@ -1,0 +1,17 @@
+export ADMIN_API_KEY="MananlovesTennis&Coding"
+export BASE_URL="http://localhost:8080"
+
+client 1{
+    export API_KEY="ck_ofC5-GnfHLn5IitCFRp4NaZ-3UyYlBWmrNN-iBpaq3Q"
+    client_id="client-1"
+    "username":"test1",
+    "password":"test@testing",
+    cookie: check cookie.txt for 1793634104
+}
+
+
+
+
+
+
+

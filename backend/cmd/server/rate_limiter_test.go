@@ -19,7 +19,7 @@ func TestCreateRateLimitedRejectsEmptyBucketWithoutCreatingJob(t *testing.T) {
 	}
 	defer db.Close()
 
-	store := NewJobStore(db)
+	store := NewJobStore(db, nil)
 	ctx := context.Background()
 	clientID := fmt.Sprintf("test-rate-client-%d", time.Now().UnixNano())
 	firstJobID := fmt.Sprintf("test-rate-job-%d", time.Now().UnixNano())

@@ -16,11 +16,11 @@ import (
 func generateJobID() string { return fmt.Sprintf("job-%d", time.Now().UnixNano()) }
 
 type JobRequest struct {
-	Type string `json:"type"`
-	A    int    `json:"a"`
-	B    int    `json:"b"`
+	Type      string `json:"type"`
+	A         int    `json:"a"`
+	B         int    `json:"b"`
 	InputPath string `json:"input_path"`
-	Query string `json:"query"`
+	Query     string `json:"query"`
 }
 
 var supportedJobTypes = map[string]bool{

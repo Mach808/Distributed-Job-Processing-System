@@ -1,10 +1,10 @@
 package main
 
 import (
-	"crypto/sha256"
 	"crypto/rand"
-	"encoding/hex"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 )
 

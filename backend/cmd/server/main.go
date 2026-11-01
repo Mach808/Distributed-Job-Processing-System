@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 )
 
 const shutdownDeadline = 15 * time.Second
@@ -28,7 +29,33 @@ func main() {
 	}
 	log.Println("connected to PostgreSQL")
 
-	store := NewJobStore(db)
+	var rdb *redis.Client
+
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL != "" {
+		opts, err := redis.ParseURL(redisURL)
+		if err != nil {
+			log.Printf("invalid Redis URL: %v", err)
+		} else {
+			client := redis.NewClient(opts)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err = client.Ping(ctx).Err()
+			cancel()
+
+			if err != nil {
+				log.Printf("Redis unavailable; continuing without cache: %v", err)
+				client.Close()
+			} else {
+				log.Println("connected to Redis")
+				rdb = client
+			}
+		}
+	} else {
+		log.Println("REDIS_URL not set; continuing without cache")
+	}
+
+	store := NewJobStore(db, rdb)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var background sync.WaitGroup
@@ -92,6 +119,13 @@ func main() {
 		background.Wait()
 	}
 	backgroundCancel()
+
+	if rdb != nil {
+		if err := rdb.Close(); err != nil {
+			log.Printf("Redis shutdown error: %v", err)
+		}
+	}
+
 	db.Close()
 }
 

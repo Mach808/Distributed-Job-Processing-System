@@ -3,10 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/joho/godotenv"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 func TestConcurrentClaim(t *testing.T) {
@@ -19,7 +20,7 @@ func TestConcurrentClaim(t *testing.T) {
 	}
 	defer db.Close()
 
-	store := NewJobStore(db)
+	store := NewJobStore(db, nil)
 
 	jobID := fmt.Sprintf("test-claim-%d", time.Now().UnixNano())
 
@@ -99,7 +100,7 @@ func TestStaleWorkerCannotComplete(t *testing.T) {
 	}
 	defer db.Close()
 
-	store := NewJobStore(db)
+	store := NewJobStore(db, nil)
 	jobID := fmt.Sprintf("test-fence-%d", time.Now().UnixNano())
 
 	_, err = db.Exec(
@@ -203,7 +204,7 @@ func TestLeaseRenewalFencing(t *testing.T) {
 	}
 	defer db.Close()
 
-	store := NewJobStore(db)
+	store := NewJobStore(db, nil)
 	jobID := fmt.Sprintf("test-lease-%d", time.Now().UnixNano())
 
 	_, err = db.Exec(
@@ -312,7 +313,7 @@ func TestLegacyCompleteAcceptsActiveLease(t *testing.T) {
 	}
 	defer db.Close()
 
-	store := NewJobStore(db)
+	store := NewJobStore(db, nil)
 	jobID := fmt.Sprintf("test-active-complete-%d", time.Now().UnixNano())
 	_, err = db.Exec(context.Background(), `
 		INSERT INTO jobs (id, type, a, b, status, retries, attempt)
@@ -355,7 +356,7 @@ func TestRecoverExpiredLease(t *testing.T) {
 	}
 	defer db.Close()
 
-	store := NewJobStore(db)
+	store := NewJobStore(db, nil)
 	jobID := fmt.Sprintf("test-recovery-%d", time.Now().UnixNano())
 
 	_, err = db.Exec(
@@ -439,7 +440,7 @@ func TestRecoveryRetryLimit(t *testing.T) {
 	}
 	defer db.Close()
 
-	store := NewJobStore(db)
+	store := NewJobStore(db, nil)
 	jobID := fmt.Sprintf("test-retry-limit-%d", time.Now().UnixNano())
 
 	_, err = db.Exec(
@@ -536,7 +537,7 @@ func TestClaimNextAndFailAttemptLifecycle(t *testing.T) {
 	}
 	defer db.Close()
 
-	store := NewJobStore(db)
+	store := NewJobStore(db, nil)
 	ctx := context.Background()
 	jobID := fmt.Sprintf("!test-claim-next-%d", time.Now().UnixNano())
 	_, err = db.Exec(ctx, `INSERT INTO jobs (id, type, a, b, status, retries, attempt) VALUES ($1, 'addition', 2, 3, 'queued', 0, 0)`, jobID)
@@ -609,7 +610,7 @@ func TestRecoverExpiredEnforcesRetryLimit(t *testing.T) {
 	}
 	defer db.Close()
 
-	store := NewJobStore(db)
+	store := NewJobStore(db, nil)
 	ctx := context.Background()
 	jobID := fmt.Sprintf("test-batch-limit-%d", time.Now().UnixNano())
 	_, err = db.Exec(ctx, `INSERT INTO jobs (id, type, a, b, status, retries, attempt, worker_id, lease_until) VALUES ($1, 'addition', 2, 3, 'processing', 2, 3, 'crashed-worker', NOW() - INTERVAL '1 second')`, jobID)

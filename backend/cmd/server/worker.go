@@ -181,37 +181,59 @@ func executeJob(job Job) (int, error) {
 
 func processImage(path string) (int, error) {
 	file, err := os.Open(path)
-	if err != nil { return 0, fmt.Errorf("open image: %w", err) }
+	if err != nil {
+		return 0, fmt.Errorf("open image: %w", err)
+	}
 	defer file.Close()
-	if _, _, err := image.DecodeConfig(file); err != nil { return 0, fmt.Errorf("decode image: %w", err) }
+	if _, _, err := image.DecodeConfig(file); err != nil {
+		return 0, fmt.Errorf("decode image: %w", err)
+	}
 	info, err := file.Stat()
-	if err != nil { return 0, fmt.Errorf("stat image: %w", err) }
+	if err != nil {
+		return 0, fmt.Errorf("stat image: %w", err)
+	}
 	return int(info.Size()), nil
 }
 
 func analyzeLog(path string) (int, error) {
 	file, err := os.Open(path)
-	if err != nil { return 0, fmt.Errorf("open log: %w", err) }
+	if err != nil {
+		return 0, fmt.Errorf("open log: %w", err)
+	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	count := 0
-	for scanner.Scan() { if strings.Contains(strings.ToUpper(scanner.Text()), "ERROR") { count++ } }
-	if err := scanner.Err(); err != nil { return 0, fmt.Errorf("read log: %w", err) }
+	for scanner.Scan() {
+		if strings.Contains(strings.ToUpper(scanner.Text()), "ERROR") {
+			count++
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("read log: %w", err)
+	}
 	return count, nil
 }
 
 func analyzeCSV(path, query string) (int, error) {
 	file, err := os.Open(path)
-	if err != nil { return 0, fmt.Errorf("open csv: %w", err) }
+	if err != nil {
+		return 0, fmt.Errorf("open csv: %w", err)
+	}
 	defer file.Close()
 	reader := csv.NewReader(file)
 	matches := 0
 	for {
 		row, err := reader.Read()
-		if err == io.EOF { break }
-		if err != nil { return 0, fmt.Errorf("read csv: %w", err) }
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, fmt.Errorf("read csv: %w", err)
+		}
 		for _, value := range row {
-			if strings.TrimSpace(value) == query { matches++ }
+			if strings.TrimSpace(value) == query {
+				matches++
+			}
 		}
 	}
 	return matches, nil

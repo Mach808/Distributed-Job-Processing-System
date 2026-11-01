@@ -2,21 +2,25 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"time"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"log"
-	"time"
+	"github.com/redis/go-redis/v9"
 )
 
 type JobStore struct {
-	db *pgxpool.Pool
+	db  *pgxpool.Pool
+	rdb *redis.Client
 }
 
-func NewJobStore(db *pgxpool.Pool) *JobStore {
-	return &JobStore{db: db}
+func NewJobStore(db *pgxpool.Pool, rdb *redis.Client) *JobStore {
+	return &JobStore{db: db, rdb: rdb}
 }
 
 // AuthenticateAPIKey validates an API key and returns its client identity.
@@ -558,6 +562,13 @@ func (s *JobStore) ClaimNext(
 		return Job{}, false, fmt.Errorf("claim next job: %w", err)
 	}
 
+	if s.rdb != nil {
+		err = s.rdb.Del(ctx, "job_status:"+job.ID).Err()
+		if err != nil {
+			log.Printf("Redis DEL error: %v", err)
+		}
+	}
+
 	return job, true, nil
 }
 
@@ -576,24 +587,59 @@ func (s *JobStore) GetContext(ctx context.Context, id string) (Job, bool, error)
 	var job Job
 	var workerID pgtype.Text
 	var leaseUntil pgtype.Timestamptz
+
+	key := "job_status:" + id
+
+	// 1. Try Redis cache
+	if s.rdb != nil {
+		val, err := s.rdb.Get(ctx, key).Result()
+
+		if err == nil {
+			err := json.Unmarshal([]byte(val), &job)
+			if err == nil {
+				return job, true, nil
+			}
+			log.Printf("Redis cache unmarshal error: %v", err)
+		} else if err != redis.Nil {
+			log.Printf("Redis GET error: %v", err)
+		}
+	}
+
+	// 2. Cache miss or Redis unavailable: query PostgreSQL
 	err := s.db.QueryRow(ctx, `
-		SELECT id, type, a, b, status, COALESCE(result, 0), retries,
-		       worker_id, attempt, lease_until
-		FROM jobs WHERE id = $1
-	`, id).Scan(&job.ID, &job.Type, &job.A, &job.B, &job.Status,
+        SELECT id, type, a, b, status, COALESCE(result, 0), retries,
+               worker_id, attempt, lease_until
+        FROM jobs WHERE id = $1
+    `, id).Scan(&job.ID, &job.Type, &job.A, &job.B, &job.Status,
 		&job.Result, &job.Retries, &workerID, &job.Attempt, &leaseUntil)
+
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Job{}, false, nil
 	}
 	if err != nil {
 		return Job{}, false, fmt.Errorf("get job: %w", err)
 	}
+
 	if workerID.Valid {
 		job.WorkerID = workerID.String
 	}
 	if leaseUntil.Valid {
 		job.LeaseUntil = leaseUntil.Time
 	}
+
+	// 3. Populate Redis cache
+	if s.rdb != nil {
+		data, err := json.Marshal(job)
+		if err != nil {
+			log.Printf("JSON marshal error: %v", err)
+		} else {
+			err = s.rdb.Set(ctx, key, data, 20*time.Second).Err()
+			if err != nil {
+				log.Printf("Redis SET error: %v", err)
+			}
+		}
+	}
+
 	return job, true, nil
 }
 
@@ -662,7 +708,16 @@ func (s *JobStore) CompleteContext(ctx context.Context, id, workerID string, att
 	if err != nil {
 		return false, fmt.Errorf("complete job: %w", err)
 	}
-	return tag.RowsAffected() == 1, nil
+	updated := tag.RowsAffected() == 1
+
+	if updated && s.rdb != nil {
+		err := s.rdb.Del(ctx, "job_status:"+id).Err()
+		if err != nil {
+			log.Printf("Redis DEL error: %v", err)
+		}
+	}
+
+	return updated, nil
 }
 
 // FailAttempt atomically transitions the current owned attempt to queued or failed.
@@ -678,22 +733,51 @@ func (s *JobStore) FailAttempt(ctx context.Context, id, workerID string, attempt
 	if err != nil {
 		return false, fmt.Errorf("fail job attempt: %w", err)
 	}
-	return tag.RowsAffected() == 1, nil
+
+	updated := tag.RowsAffected() == 1
+	if updated && s.rdb != nil {
+		err := s.rdb.Del(ctx, "job_status:"+id).Err() //del job from cache
+		if err != nil {
+			log.Printf("Redis DEL error: %v", err)
+		}
+	}
+	return updated, nil
 }
 
 // RecoverExpired atomically recovers every expired processing lease. Repeated
 // recovery loops and multiple server instances are safe because each update is conditional.
 func (s *JobStore) RecoverExpired(ctx context.Context, retryLimit int) error {
-	_, err := s.db.Exec(ctx, `
+	rows, err := s.db.Query(ctx, `
 		UPDATE jobs SET
 			status = CASE WHEN retries + 1 >= $1 THEN 'failed' ELSE 'queued' END,
-			retries = retries + 1, worker_id = NULL, lease_until = NULL
+			retries = retries + 1,
+			worker_id = NULL,
+			lease_until = NULL
 		WHERE status = 'processing' AND lease_until <= NOW()
+		RETURNING id
 	`, retryLimit)
 	if err != nil {
 		return fmt.Errorf("recover expired jobs: %w", err)
 	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id string
+
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("scan recovered job ID: %w", err)
+		}
+		if s.rdb != nil {
+			err := s.rdb.Del(ctx, "job_status:"+id).Err()
+			if err != nil {
+				log.Printf("Redis DEL error for job %s: %v", id, err)
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate recovered jobs: %w", err)
+	}
+
 	return nil
 }
-
-
