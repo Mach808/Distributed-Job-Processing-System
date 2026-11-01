@@ -14,5 +14,7 @@ type Job struct {
 	Attempt    int
 	WorkerID   string
 	InputPath  string `json:"-"`
-	Query      string `json:"Query,omitempty"`
+	InputKey   string `json:"input_key,omitempty"`
+	OutputKey  string `json:"output_key,omitempty"`
+	Query      string `json:"query,omitempty"`
 }

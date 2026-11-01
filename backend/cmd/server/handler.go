@@ -1,12 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -14,11 +13,11 @@ import (
 func generateJobID() string { return fmt.Sprintf("job-%d", time.Now().UnixNano()) }
 
 type JobRequest struct {
-	Type string `json:"type"`
-	A    int    `json:"a"`
-	B    int    `json:"b"`
-	InputPath string `json:"input_path"`
-	Query string `json:"query"`
+	Type     string `json:"type"`
+	A        int    `json:"a"`
+	B        int    `json:"b"`
+	InputKey string `json:"input_key"`
+	Query    string `json:"query"`
 }
 
 var supportedJobTypes = map[string]bool{
@@ -27,9 +26,38 @@ var supportedJobTypes = map[string]bool{
 	"image_processing": true, "log_analysis": true, "csv_processing": true,
 }
 
-type Handler struct{ store *JobStore }
+type Handler struct {
+	store *JobStore
+	s3    S3Service
+}
 
-func NewHandler(store *JobStore) *Handler { return &Handler{store: store} }
+type downloadResponse struct {
+	DownloadURL string `json:"download_url"`
+	ExpiresIn   int64  `json:"expires_in"`
+}
+
+func NewHandler(store *JobStore, s3Client S3Service) *Handler {
+	return &Handler{store: store, s3: s3Client}
+}
+
+func (h *Handler) ListS3Files(w http.ResponseWriter, r *http.Request) {
+	if h.s3 == nil {
+		http.Error(w, "S3 is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	files, err := h.s3.ListInputFiles(r.Context())
+	if err != nil {
+		log.Printf("list S3 input files: %v", err)
+		http.Error(w, "Unable to list S3 input files", http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string][]S3File{"files": files}); err != nil {
+		log.Printf("write S3 file list response: %v", err)
+	}
+}
 
 func (h *Handler) CreateJob(w http.ResponseWriter, r *http.Request) {
 	var request JobRequest
@@ -48,16 +76,18 @@ func (h *Handler) CreateJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if request.Type == "image_processing" || request.Type == "log_analysis" || request.Type == "csv_processing" {
-		cleanPath, err := localInputPath(request.InputPath)
-		if err != nil {
+	if isFileProcessingJob(request.Type) {
+		if h.s3 == nil {
+			http.Error(w, "S3 is not configured", http.StatusServiceUnavailable)
+			return
+		}
+		if err := verifyInputObject(r.Context(), h.s3, request.InputKey); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		request.InputPath = cleanPath
 	}
 	request.Query = strings.TrimSpace(request.Query)
-	job := Job{ID: generateJobID(), Type: request.Type, A: request.A, B: request.B, InputPath: request.InputPath, Query: request.Query, Status: "queued"}
+	job := Job{ID: generateJobID(), Type: request.Type, A: request.A, B: request.B, InputKey: request.InputKey, Query: request.Query, Status: "queued"}
 	if err := h.store.CreateContext(r.Context(), job); err != nil {
 		log.Printf("create job: %v", err)
 		http.Error(w, "Failed to create job", http.StatusInternalServerError)
@@ -89,8 +119,8 @@ func validateJobRequest(request JobRequest) error {
 			return fmt.Errorf("retry_demo requires first number between 0 and 2")
 		}
 	case "image_processing", "log_analysis", "csv_processing":
-		if strings.TrimSpace(request.InputPath) == "" {
-			return fmt.Errorf("%s requires input_path", request.Type)
+		if err := validateInputKey(request.InputKey); err != nil {
+			return fmt.Errorf("%s: %w", request.Type, err)
 		}
 		if request.Type == "csv_processing" && strings.TrimSpace(request.Query) == "" {
 			return fmt.Errorf("csv_processing requires query")
@@ -99,27 +129,37 @@ func validateJobRequest(request JobRequest) error {
 	return nil
 }
 
-func localInputPath(input string) (string, error) {
-	root := os.Getenv("JOB_DATA_DIR")
-	if root == "" {
-		root = "data/jobs"
+func isFileProcessingJob(jobType string) bool {
+	return jobType == "csv_processing" || jobType == "log_analysis" || jobType == "image_processing"
+}
+
+func validateInputKey(key string) error {
+	if strings.TrimSpace(key) == "" {
+		return fmt.Errorf("requires input_key")
 	}
-	root, err := filepath.Abs(root)
-	if err != nil {
-		return "", fmt.Errorf("invalid job data directory")
+	if key != strings.TrimSpace(key) {
+		return fmt.Errorf("input_key must not have leading or trailing whitespace")
 	}
-	clean := filepath.Clean(input)
-	if filepath.IsAbs(clean) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("input_path must be a relative path inside %s", root)
+	if strings.ContainsAny(key, "\\\x00") || !strings.HasPrefix(key, "input/") || key == "input/" {
+		return fmt.Errorf("input_key must be a valid key under input/")
 	}
-	full := filepath.Join(root, clean)
-	if !strings.HasPrefix(full, root+string(filepath.Separator)) {
-		return "", fmt.Errorf("input_path must stay inside %s", root)
+	parts := strings.Split(key, "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("input_key must not contain empty or traversal path segments")
+		}
 	}
-	if _, err := os.Stat(full); err != nil {
-		return "", fmt.Errorf("input file is not available: %w", err)
+	return nil
+}
+
+func verifyInputObject(ctx context.Context, store S3ObjectStore, key string) error {
+	if err := validateInputKey(key); err != nil {
+		return err
 	}
-	return full, nil
+	if err := store.HeadInputObject(ctx, key); err != nil {
+		return fmt.Errorf("input object does not exist")
+	}
+	return nil
 }
 
 func (h *Handler) GetJob(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +177,57 @@ func (h *Handler) GetJob(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(job); err != nil {
 		log.Printf("write get response: %v", err)
 	}
+}
+
+func (h *Handler) DownloadJob(w http.ResponseWriter, r *http.Request) {
+	job, ok, err := h.store.GetContext(r.Context(), r.PathValue("id"))
+	if err != nil {
+		log.Printf("get job for download: %v", err)
+		http.Error(w, "Failed to retrieve job", http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		http.Error(w, "Job not found", http.StatusNotFound)
+		return
+	}
+	if job.Status != "completed" {
+		http.Error(w, "Job is not completed", http.StatusConflict)
+		return
+	}
+	if err := validateOutputKey(job.OutputKey); err != nil {
+		http.Error(w, "Job output is not available", http.StatusNotFound)
+		return
+	}
+	presigner, ok := h.s3.(S3OutputPresigner)
+	if !ok {
+		http.Error(w, "S3 is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	url, expiry, err := presigner.PresignOutputGet(r.Context(), job.OutputKey)
+	if err != nil {
+		log.Printf("presign output for job %s: %v", job.ID, err)
+		http.Error(w, "Unable to create download URL", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(downloadResponse{DownloadURL: url, ExpiresIn: int64(expiry / time.Second)}); err != nil {
+		log.Printf("write download response: %v", err)
+	}
+}
+
+func validateOutputKey(key string) error {
+	if strings.TrimSpace(key) == "" || key != strings.TrimSpace(key) || !strings.HasPrefix(key, "output/") || key == "output/" {
+		return fmt.Errorf("output key must be under output/")
+	}
+	if strings.ContainsAny(key, "\\\x00") {
+		return fmt.Errorf("output key contains invalid characters")
+	}
+	for _, part := range strings.Split(key, "/") {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("output key contains invalid path segments")
+		}
+	}
+	return nil
 }
 
 func (h *Handler) ListJobs(w http.ResponseWriter, r *http.Request) {

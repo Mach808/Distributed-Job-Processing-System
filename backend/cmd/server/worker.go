@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -23,13 +24,22 @@ const (
 )
 
 type Worker struct {
-	ID      string
-	store   *JobStore
-	execute func(Job) (int, error)
+	ID         string
+	store      *JobStore
+	execute    func(Job) (int, error)
+	downloader S3InputDownloader
+	uploader   S3OutputUploader
 }
 
-func NewWorker(id string, store *JobStore) *Worker {
-	return &Worker{ID: id, store: store, execute: executeJob}
+func NewWorker(id string, store *JobStore, downloaders ...S3InputDownloader) *Worker {
+	worker := &Worker{ID: id, store: store, execute: executeJob}
+	if len(downloaders) > 0 {
+		worker.downloader = downloaders[0]
+		if uploader, ok := downloaders[0].(S3OutputUploader); ok {
+			worker.uploader = uploader
+		}
+	}
+	return worker
 }
 
 // Start continuously claims jobs from PostgreSQL. The database is the only queue;
@@ -91,8 +101,14 @@ func (w *Worker) process(parent context.Context, job Job) {
 	if execute == nil {
 		execute = executeJob
 	}
+	outputKey := ""
 	result, err := runJobSafely(func() (int, error) {
-		return execute(job)
+		result, err := w.executeWithInput(ctx, job, execute)
+		if err != nil {
+			return 0, err
+		}
+		outputKey, err = w.uploadJobOutput(ctx, job, result)
+		return result, err
 	})
 	cancel()
 	<-heartbeatDone
@@ -111,7 +127,7 @@ func (w *Worker) process(parent context.Context, job Job) {
 		return
 	}
 
-	completed, completeErr := w.store.CompleteContext(parent, job.ID, w.ID, job.Attempt, result)
+	completed, completeErr := w.store.CompleteContext(parent, job.ID, w.ID, job.Attempt, result, outputKey)
 	if completeErr != nil {
 		log.Printf("worker %s: complete job %s: %v; lease recovery will handle it", w.ID, job.ID, completeErr)
 		return
@@ -119,6 +135,131 @@ func (w *Worker) process(parent context.Context, job Job) {
 	if completed {
 		log.Printf("worker %s completed job %s result=%d", w.ID, job.ID, result)
 	}
+}
+
+func (w *Worker) uploadJobOutput(ctx context.Context, job Job, result int) (string, error) {
+	if !isFileProcessingJob(job.Type) {
+		return "", nil
+	}
+	if w.uploader == nil {
+		return "", fmt.Errorf("S3 output uploader is not configured")
+	}
+
+	path, key, contentType, err := createJobOutput(job, result)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Printf("worker %s: remove temporary output: %v", w.ID, removeErr)
+		}
+	}()
+
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open temporary output: %w", err)
+	}
+	defer file.Close()
+	if err := w.uploader.UploadOutputObject(ctx, key, file, contentType); err != nil {
+		return "", fmt.Errorf("upload job output: %w", err)
+	}
+	return key, nil
+}
+
+func createJobOutput(job Job, result int) (string, string, string, error) {
+	var extension, content string
+	contentType := "text/plain"
+	switch job.Type {
+	case "csv_processing":
+		extension = ".csv"
+		contentType = "text/csv"
+		content = fmt.Sprintf("result\n%d\n", result)
+	case "log_analysis":
+		extension = ".log"
+		content = fmt.Sprintf("result=%d\n", result)
+	case "image_processing":
+		extension = ".txt"
+		content = fmt.Sprintf("result=%d\n", result)
+	default:
+		return "", "", "", fmt.Errorf("job type %q does not produce an S3 output", job.Type)
+	}
+
+	file, err := os.CreateTemp("", "djs-job-output-*"+extension)
+	if err != nil {
+		return "", "", "", fmt.Errorf("create temporary output file: %w", err)
+	}
+	path := file.Name()
+	removeOnError := true
+	defer func() {
+		if removeOnError {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := io.WriteString(file, content); err != nil {
+		_ = file.Close()
+		return "", "", "", fmt.Errorf("write temporary output file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return "", "", "", fmt.Errorf("close temporary output file: %w", err)
+	}
+	removeOnError = false
+	return path, fmt.Sprintf("output/%s/result%s", job.ID, extension), contentType, nil
+}
+
+func (w *Worker) executeWithInput(ctx context.Context, job Job, execute func(Job) (int, error)) (int, error) {
+	if !isFileProcessingJob(job.Type) {
+		return execute(job)
+	}
+	if err := validateInputKey(job.InputKey); err != nil {
+		return 0, fmt.Errorf("invalid input key: %w", err)
+	}
+	if w.downloader == nil {
+		return 0, fmt.Errorf("S3 input downloader is not configured")
+	}
+
+	localPath, err := downloadJobInput(ctx, w.downloader, job.InputKey)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if removeErr := os.Remove(localPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Printf("worker %s: remove temporary input: %v", w.ID, removeErr)
+		}
+	}()
+
+	job.InputPath = localPath
+	return execute(job)
+}
+
+func downloadJobInput(ctx context.Context, downloader S3InputDownloader, inputKey string) (string, error) {
+	body, err := downloader.DownloadInputObject(ctx, inputKey)
+	if err != nil {
+		return "", fmt.Errorf("download input object: %w", err)
+	}
+	defer body.Close()
+
+	extension := filepath.Ext(filepath.Base(inputKey))
+	file, err := os.CreateTemp("", "djs-job-input-*"+extension)
+	if err != nil {
+		return "", fmt.Errorf("create temporary input file: %w", err)
+	}
+	path := file.Name()
+	removeOnError := true
+	defer func() {
+		if removeOnError {
+			_ = os.Remove(path)
+		}
+	}()
+
+	if _, err := io.Copy(file, body); err != nil {
+		_ = file.Close()
+		return "", fmt.Errorf("write temporary input file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("close temporary input file: %w", err)
+	}
+	removeOnError = false
+	return path, nil
 }
 
 // runJobSafely contains panics raised while executing one job and turns them
@@ -181,37 +322,59 @@ func executeJob(job Job) (int, error) {
 
 func processImage(path string) (int, error) {
 	file, err := os.Open(path)
-	if err != nil { return 0, fmt.Errorf("open image: %w", err) }
+	if err != nil {
+		return 0, fmt.Errorf("open image: %w", err)
+	}
 	defer file.Close()
-	if _, _, err := image.DecodeConfig(file); err != nil { return 0, fmt.Errorf("decode image: %w", err) }
+	if _, _, err := image.DecodeConfig(file); err != nil {
+		return 0, fmt.Errorf("decode image: %w", err)
+	}
 	info, err := file.Stat()
-	if err != nil { return 0, fmt.Errorf("stat image: %w", err) }
+	if err != nil {
+		return 0, fmt.Errorf("stat image: %w", err)
+	}
 	return int(info.Size()), nil
 }
 
 func analyzeLog(path string) (int, error) {
 	file, err := os.Open(path)
-	if err != nil { return 0, fmt.Errorf("open log: %w", err) }
+	if err != nil {
+		return 0, fmt.Errorf("open log: %w", err)
+	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	count := 0
-	for scanner.Scan() { if strings.Contains(strings.ToUpper(scanner.Text()), "ERROR") { count++ } }
-	if err := scanner.Err(); err != nil { return 0, fmt.Errorf("read log: %w", err) }
+	for scanner.Scan() {
+		if strings.Contains(strings.ToUpper(scanner.Text()), "ERROR") {
+			count++
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("read log: %w", err)
+	}
 	return count, nil
 }
 
 func analyzeCSV(path, query string) (int, error) {
 	file, err := os.Open(path)
-	if err != nil { return 0, fmt.Errorf("open csv: %w", err) }
+	if err != nil {
+		return 0, fmt.Errorf("open csv: %w", err)
+	}
 	defer file.Close()
 	reader := csv.NewReader(file)
 	matches := 0
 	for {
 		row, err := reader.Read()
-		if err == io.EOF { break }
-		if err != nil { return 0, fmt.Errorf("read csv: %w", err) }
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, fmt.Errorf("read csv: %w", err)
+		}
 		for _, value := range row {
-			if strings.TrimSpace(value) == query { matches++ }
+			if strings.TrimSpace(value) == query {
+				matches++
+			}
 		}
 	}
 	return matches, nil

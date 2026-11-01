@@ -29,11 +29,15 @@ func main() {
 	log.Println("connected to PostgreSQL")
 
 	store := NewJobStore(db)
+	s3Client, err := NewS3Client(context.Background())
+	if err != nil {
+		log.Fatalf("S3 configuration failed: %v", err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var background sync.WaitGroup
 	for i := 0; i < 10; i++ {
-		worker := NewWorker(fmt.Sprintf("worker-%d", i+1), store)
+		worker := NewWorker(fmt.Sprintf("worker-%d", i+1), store, s3Client)
 		background.Add(1)
 		go func() {
 			defer background.Done()
@@ -47,9 +51,11 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
-	handler := NewHandler(store)
+	handler := NewHandler(store, s3Client)
 	mux.HandleFunc("POST /jobs", handler.CreateJob)
+	mux.HandleFunc("GET /s3/files", handler.ListS3Files)
 	mux.HandleFunc("GET /jobs", handler.ListJobs)
+	mux.HandleFunc("GET /jobs/{id}/download", handler.DownloadJob)
 	mux.HandleFunc("GET /jobs/{id}", handler.GetJob)
 	dashboard, err := newDashboardHandler()
 	if err != nil {

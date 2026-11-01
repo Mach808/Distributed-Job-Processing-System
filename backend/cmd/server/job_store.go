@@ -25,7 +25,7 @@ func (s *JobStore) Get(id string) (Job, bool) {
 	var leaseUntil pgtype.Timestamptz
 
 	err := s.db.QueryRow(context.Background(), `
-		SELECT id, type, a, b, status,
+		SELECT id, type, a, b, COALESCE(input_key, ''), status, COALESCE(output_key, ''),
 		       COALESCE(result, 0), retries,
 		       worker_id, attempt, lease_until
 		FROM jobs
@@ -35,7 +35,9 @@ func (s *JobStore) Get(id string) (Job, bool) {
 		&job.Type,
 		&job.A,
 		&job.B,
+		&job.InputKey,
 		&job.Status,
+		&job.OutputKey,
 		&job.Result,
 		&job.Retries,
 		&workerID,
@@ -160,7 +162,9 @@ func (s *JobStore) Recover(id string) (Job, bool, error) {
 			type,
 			a,
 			b,
+			COALESCE(input_key, ''),
 			status,
+			COALESCE(output_key, ''),
 			COALESCE(result, 0),
 			retries,
 			worker_id,
@@ -173,7 +177,9 @@ func (s *JobStore) Recover(id string) (Job, bool, error) {
 		&job.Type,
 		&job.A,
 		&job.B,
+		&job.InputKey,
 		&job.Status,
+		&job.OutputKey,
 		&job.Result,
 		&job.Retries,
 		&workerID,
@@ -222,7 +228,9 @@ func (s *JobStore) Claim(id string, workerID string) (Job, bool, error) {
 			type,
 			a,
 			b,
+			COALESCE(input_key, ''),
 			status,
+			COALESCE(output_key, ''),
 			COALESCE(result, 0),
 			retries,
 			worker_id,
@@ -236,7 +244,9 @@ func (s *JobStore) Claim(id string, workerID string) (Job, bool, error) {
 		&job.Type,
 		&job.A,
 		&job.B,
+		&job.InputKey,
 		&job.Status,
+		&job.OutputKey,
 		&job.Result,
 		&job.Retries,
 		&job.WorkerID,
@@ -262,7 +272,7 @@ func (s *JobStore) Claim(id string, workerID string) (Job, bool, error) {
 
 func (s *JobStore) GetExpiredJobs() ([]Job, error) {
 	rows, err := s.db.Query(context.Background(), `
-		SELECT id, type, a, b, status,
+		SELECT id, type, a, b, COALESCE(input_key, ''), status, COALESCE(output_key, ''),
 		       COALESCE(result, 0), retries,
 		       worker_id, attempt, lease_until
 		FROM jobs
@@ -286,7 +296,9 @@ func (s *JobStore) GetExpiredJobs() ([]Job, error) {
 			&job.Type,
 			&job.A,
 			&job.B,
+			&job.InputKey,
 			&job.Status,
+			&job.OutputKey,
 			&job.Result,
 			&job.Retries,
 			&workerID,
@@ -315,7 +327,7 @@ func (s *JobStore) GetExpiredJobs() ([]Job, error) {
 
 func (s *JobStore) GetQueuedJobs() ([]Job, error) {
 	rows, err := s.db.Query(context.Background(), `
-		SELECT id, type, a, b, status,
+		SELECT id, type, a, b, COALESCE(input_key, ''), status, COALESCE(output_key, ''),
 		       COALESCE(result, 0), retries,
 		       worker_id, attempt, lease_until
 		FROM jobs
@@ -339,7 +351,9 @@ func (s *JobStore) GetQueuedJobs() ([]Job, error) {
 			&job.Type,
 			&job.A,
 			&job.B,
+			&job.InputKey,
 			&job.Status,
+			&job.OutputKey,
 			&job.Result,
 			&job.Retries,
 			&workerID,
@@ -370,9 +384,9 @@ func (s *JobStore) Create(job Job) error {
 	_, err := s.db.Exec(context.Background(), `
 		INSERT INTO jobs (
 			id, type, a, b, status, result,
-			retries, worker_id, attempt, lease_until
+			retries, worker_id, attempt, lease_until, input_key, output_key
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''), NULLIF($12, ''))
 	`,
 		job.ID,
 		job.Type,
@@ -384,6 +398,8 @@ func (s *JobStore) Create(job Job) error {
 		nil,
 		job.Attempt,
 		nil,
+		job.InputKey,
+		job.OutputKey,
 	)
 	if err != nil {
 		return fmt.Errorf("create job: %w", err)
@@ -430,6 +446,8 @@ func (s *JobStore) ClaimNext(
             j.a,
             j.b,
 			COALESCE(j.input_path, ''),
+			COALESCE(j.input_key, ''),
+			COALESCE(j.output_key, ''),
 			COALESCE(j.query, ''),
             j.status,
             COALESCE(j.result, 0),
@@ -443,6 +461,8 @@ func (s *JobStore) ClaimNext(
 		&job.A,
 		&job.B,
 		&job.InputPath,
+		&job.InputKey,
+		&job.OutputKey,
 		&job.Query,
 		&job.Status,
 		&job.Result,
@@ -464,9 +484,9 @@ func (s *JobStore) ClaimNext(
 
 func (s *JobStore) CreateContext(ctx context.Context, job Job) error {
 	_, err := s.db.Exec(ctx, `
-		INSERT INTO jobs (id, type, a, b, input_path, query, status, result, retries, worker_id, attempt, lease_until)
-		VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), 'queued', NULL, 0, NULL, 0, NULL)
-	`, job.ID, job.Type, job.A, job.B, job.InputPath, job.Query)
+		INSERT INTO jobs (id, type, a, b, input_path, input_key, output_key, query, status, result, retries, worker_id, attempt, lease_until)
+		VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), 'queued', NULL, 0, NULL, 0, NULL)
+	`, job.ID, job.Type, job.A, job.B, job.InputPath, job.InputKey, job.OutputKey, job.Query)
 	if err != nil {
 		return fmt.Errorf("create job: %w", err)
 	}
@@ -478,11 +498,11 @@ func (s *JobStore) GetContext(ctx context.Context, id string) (Job, bool, error)
 	var workerID pgtype.Text
 	var leaseUntil pgtype.Timestamptz
 	err := s.db.QueryRow(ctx, `
-		SELECT id, type, a, b, status, COALESCE(result, 0), retries,
+		SELECT id, type, a, b, COALESCE(input_key, ''), status, COALESCE(output_key, ''), COALESCE(result, 0), retries,
 		       worker_id, attempt, lease_until
 		FROM jobs WHERE id = $1
-	`, id).Scan(&job.ID, &job.Type, &job.A, &job.B, &job.Status,
-		&job.Result, &job.Retries, &workerID, &job.Attempt, &leaseUntil)
+	`, id).Scan(&job.ID, &job.Type, &job.A, &job.B, &job.InputKey, &job.Status,
+		&job.OutputKey, &job.Result, &job.Retries, &workerID, &job.Attempt, &leaseUntil)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Job{}, false, nil
 	}
@@ -503,7 +523,7 @@ func (s *JobStore) ListRecentContext(ctx context.Context, limit int) ([]Job, err
 		limit = 100
 	}
 	rows, err := s.db.Query(ctx, `
-		SELECT id, type, a, b, status, COALESCE(result, 0), retries,
+		SELECT id, type, a, b, COALESCE(input_key, ''), status, COALESCE(output_key, ''), COALESCE(result, 0), retries,
 		       worker_id, attempt, lease_until
 		FROM jobs
 		ORDER BY id DESC
@@ -519,8 +539,8 @@ func (s *JobStore) ListRecentContext(ctx context.Context, limit int) ([]Job, err
 		var job Job
 		var workerID pgtype.Text
 		var leaseUntil pgtype.Timestamptz
-		if err := rows.Scan(&job.ID, &job.Type, &job.A, &job.B, &job.Status,
-			&job.Result, &job.Retries, &workerID, &job.Attempt, &leaseUntil); err != nil {
+		if err := rows.Scan(&job.ID, &job.Type, &job.A, &job.B, &job.InputKey, &job.Status,
+			&job.OutputKey, &job.Result, &job.Retries, &workerID, &job.Attempt, &leaseUntil); err != nil {
 			return nil, fmt.Errorf("scan listed job: %w", err)
 		}
 		if workerID.Valid {
@@ -553,13 +573,17 @@ func (s *JobStore) RenewLeaseContext(ctx context.Context, id, workerID string, a
 	return tag.RowsAffected() == 1, nil
 }
 
-func (s *JobStore) CompleteContext(ctx context.Context, id, workerID string, attempt, result int) (bool, error) {
+func (s *JobStore) CompleteContext(ctx context.Context, id, workerID string, attempt, result int, outputKeys ...string) (bool, error) {
+	outputKey := ""
+	if len(outputKeys) > 0 {
+		outputKey = outputKeys[0]
+	}
 	tag, err := s.db.Exec(ctx, `
-		UPDATE jobs SET status = 'completed', result = $1,
+		UPDATE jobs SET status = 'completed', result = $1, output_key = NULLIF($2, ''),
 			worker_id = NULL, lease_until = NULL
-		WHERE id = $2 AND status = 'processing' AND worker_id = $3
-		  AND attempt = $4 AND lease_until > NOW()
-	`, result, id, workerID, attempt)
+		WHERE id = $3 AND status = 'processing' AND worker_id = $4
+		  AND attempt = $5 AND lease_until > NOW()
+	`, result, outputKey, id, workerID, attempt)
 	if err != nil {
 		return false, fmt.Errorf("complete job: %w", err)
 	}

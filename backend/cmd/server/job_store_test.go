@@ -633,3 +633,75 @@ func TestRecoverExpiredEnforcesRetryLimit(t *testing.T) {
 		t.Fatalf("retry limit not enforced by batch recovery: %+v", job)
 	}
 }
+
+func TestJobStorePersistsAndRetrievesInputKey(t *testing.T) {
+	if err := godotenv.Load("../../.env"); err != nil {
+		t.Fatalf("failed to load .env: %v", err)
+	}
+	db, err := connectDB()
+	if err != nil {
+		t.Fatalf("connectDB failed: %v", err)
+	}
+	defer db.Close()
+
+	store := NewJobStore(db)
+	ctx := context.Background()
+	jobID := fmt.Sprintf("test-input-key-%d", time.Now().UnixNano())
+	defer func() {
+		if _, err := db.Exec(ctx, `DELETE FROM jobs WHERE id = $1`, jobID); err != nil {
+			t.Errorf("cleanup failed: %v", err)
+		}
+	}()
+
+	inputKey := "input/students.csv"
+	if err := store.CreateContext(ctx, Job{ID: jobID, Type: "csv_processing", InputKey: inputKey, Query: "Manan"}); err != nil {
+		t.Fatalf("CreateContext failed: %v", err)
+	}
+	job, found, err := store.GetContext(ctx, jobID)
+	if err != nil || !found {
+		t.Fatalf("GetContext: found=%v err=%v", found, err)
+	}
+	if job.InputKey != inputKey {
+		t.Fatalf("InputKey = %q, want %q", job.InputKey, inputKey)
+	}
+}
+
+func TestJobStorePersistsOutputKeyOnCompletion(t *testing.T) {
+	if err := godotenv.Load("../../.env"); err != nil {
+		t.Fatalf("failed to load .env: %v", err)
+	}
+	db, err := connectDB()
+	if err != nil {
+		t.Fatalf("connectDB failed: %v", err)
+	}
+	defer db.Close()
+
+	store := NewJobStore(db)
+	ctx := context.Background()
+	jobID := fmt.Sprintf("test-output-key-%d", time.Now().UnixNano())
+	defer func() {
+		if _, err := db.Exec(ctx, `DELETE FROM jobs WHERE id = $1`, jobID); err != nil {
+			t.Errorf("cleanup failed: %v", err)
+		}
+	}()
+
+	if err := store.CreateContext(ctx, Job{ID: jobID, Type: "csv_processing", InputKey: "input/students.csv"}); err != nil {
+		t.Fatalf("CreateContext failed: %v", err)
+	}
+	claimed, ok, err := store.ClaimNext(ctx, "output-worker", 30*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("ClaimNext: claimed=%v err=%v", ok, err)
+	}
+	outputKey := "output/" + jobID + "/result.csv"
+	completed, err := store.CompleteContext(ctx, jobID, "output-worker", claimed.Attempt, 4, outputKey)
+	if err != nil || !completed {
+		t.Fatalf("CompleteContext: completed=%v err=%v", completed, err)
+	}
+	job, found, err := store.GetContext(ctx, jobID)
+	if err != nil || !found {
+		t.Fatalf("GetContext: found=%v err=%v", found, err)
+	}
+	if job.Status != "completed" || job.OutputKey != outputKey {
+		t.Fatalf("unexpected completed job: %+v", job)
+	}
+}
