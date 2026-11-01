@@ -9,7 +9,16 @@
     fibonacci: { label: 'Fibonacci number', operator: 'index', help: 'Computes Fibonacci(A), where A is from 0 to 46. B is ignored.' },
     prime_count: { label: 'Count primes', operator: '≤', help: 'Counts primes up to A (2 to 10,000,000). B is ignored.' },
     retry_demo: { label: 'Retry demonstration', operator: 'retries', help: 'Fails A times, then completes with B. Set A from 0 to 2 to see retries.' },
-    csv_processing: { label: 'Search CSV value', operator: 'count', help: 'Counts exact cell matches in a local CSV file.' },
+    csv_processing: { label: 'CSV Processing', operator: 'count', help: 'Counts exact cell matches in the selected CSV file.' },
+    log_analysis: { label: 'Log Analysis', operator: 'analysis', help: 'Counts lines containing ERROR in the selected log file.' },
+    image_processing: { label: 'Image Processing', operator: 'analysis', help: 'Validates the selected image file.' },
+  };
+  const fileJobTypes = new Set(['csv_processing', 'log_analysis', 'image_processing']);
+  const arithmeticJobTypes = Object.keys(jobTypes).filter((type) => !fileJobTypes.has(type));
+  const fileTypeHelp = {
+    csv_processing: 'Counts exact cell matches in the selected CSV file.',
+    log_analysis: 'Counts lines containing ERROR in the selected log file.',
+    image_processing: 'Validates the selected image file.',
   };
   const records = new Map();
   let refreshing = false;
@@ -20,6 +29,15 @@
     operator: document.querySelector('#operator'),
     help: document.querySelector('#job-help'),
     formMessage: document.querySelector('#form-message'),
+    fileForm: document.querySelector('#file-job-form'),
+    fileType: document.querySelector('#file-type'),
+    fileTypeHelp: document.querySelector('#file-type-help'),
+    s3File: document.querySelector('#s3-file'),
+    refreshFiles: document.querySelector('#refresh-files'),
+    fileListMessage: document.querySelector('#file-list-message'),
+    fileQueryField: document.querySelector('#file-query-field'),
+    fileQuery: document.querySelector('#file-query'),
+    fileFormMessage: document.querySelector('#file-form-message'),
     randomCount: document.querySelector('#random-count'),
     randomSubmit: document.querySelector('#random-submit'),
     lookupForm: document.querySelector('#lookup-form'),
@@ -61,7 +79,7 @@
   }
 
   function randomJobRequest() {
-    const types = Object.keys(jobTypes);
+    const types = arithmeticJobTypes;
     const type = types[randomInt(0, types.length - 1)];
     let a = randomInt(-100, 100);
     let b = randomInt(-100, 100);
@@ -104,7 +122,22 @@
       const detail = (await response.text()).trim();
       throw new Error(detail || `Request failed (${response.status})`);
     }
-    return response.json();
+    const jobs = await response.json();
+    if (!Array.isArray(jobs)) throw new Error('Jobs response was malformed');
+    return jobs;
+  }
+
+  async function requestInputFiles() {
+    const response = await fetch('/s3/files', {
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) {
+      const detail = (await response.text()).trim();
+      throw new Error(detail || `Request failed (${response.status})`);
+    }
+    const payload = await response.json();
+    if (!payload || !Array.isArray(payload.files)) throw new Error('S3 file response was malformed');
+    return payload.files.filter((file) => file && typeof file.name === 'string' && typeof file.key === 'string');
   }
 
   function makeCell(className = '') {
@@ -151,6 +184,12 @@
           : type?.operator === 'retries' ? `${job.A} planned retries → ${job.B}`
             : `${job.A} ${type?.operator || '?'} ${job.B}`;
       operationCell.append(expression);
+      if (fileJobTypes.has(job.Type) && job.Query) {
+        const query = document.createElement('span');
+        query.className = 'job-sub';
+        query.textContent = `query: ${job.Query}`;
+        operationCell.append(query);
+      }
     }
     row.append(operationCell);
 
@@ -188,6 +227,36 @@
       attemptCell.append(retries);
     }
     row.append(attemptCell);
+
+    const inputCell = makeCell();
+    const input = document.createElement('span');
+    input.className = 'job-sub job-key';
+    input.textContent = job?.InputKey || '—';
+    input.title = job?.InputKey || '';
+    inputCell.append(input);
+    row.append(inputCell);
+
+    const outputCell = makeCell();
+    const output = document.createElement('span');
+    output.className = 'job-sub job-key';
+    output.textContent = job?.OutputKey || '—';
+    output.title = job?.OutputKey || '';
+    outputCell.append(output);
+    if (job && fileJobTypes.has(job.Type) && job.Status === 'completed' && job.OutputKey) {
+      const download = document.createElement('button');
+      download.type = 'button';
+      download.className = 'download-button';
+      download.textContent = 'Download';
+      download.addEventListener('click', () => downloadOutput(id, download));
+      outputCell.append(download);
+    }
+    if (record.downloadError) {
+      const error = document.createElement('span');
+      error.className = 'row-error';
+      error.textContent = record.downloadError;
+      outputCell.append(error);
+    }
+    row.append(outputCell);
 
     const actionCell = makeCell();
     const remove = document.createElement('button');
@@ -249,11 +318,62 @@
     render();
   }
 
+  async function refreshInputFiles() {
+    elements.refreshFiles.disabled = true;
+    elements.fileListMessage.className = 'file-list-message';
+    elements.fileListMessage.textContent = 'Loading available files…';
+    try {
+      const files = await requestInputFiles();
+      elements.s3File.replaceChildren();
+      if (files.length === 0) {
+        elements.s3File.add(new Option('No input files available', ''));
+        elements.fileListMessage.textContent = 'No supported files found under input/. Upload an input file before submitting a job.';
+        return;
+      }
+      elements.s3File.add(new Option('Choose an input file…', ''));
+      for (const file of files) elements.s3File.add(new Option(file.name, file.key));
+      elements.fileListMessage.textContent = `${files.length} file${files.length === 1 ? '' : 's'} available`;
+    } catch (error) {
+      elements.s3File.replaceChildren(new Option('Unable to load S3 files', ''));
+      elements.fileListMessage.className = 'file-list-message error';
+      elements.fileListMessage.textContent = error.message;
+    } finally {
+      elements.refreshFiles.disabled = false;
+    }
+  }
+
+  async function downloadOutput(id, button) {
+    const record = records.get(id) || {};
+    button.disabled = true;
+    button.textContent = 'Preparing…';
+    delete record.downloadError;
+    try {
+      const response = await fetch(`/jobs/${encodeURIComponent(id)}/download`, {
+        headers: { Accept: 'application/json' },
+      });
+      if (!response.ok) {
+        const detail = (await response.text()).trim();
+        throw new Error(detail || `Download request failed (${response.status})`);
+      }
+      const payload = await response.json();
+      if (!payload || typeof payload.download_url !== 'string' || !payload.download_url) {
+        throw new Error('Download response was malformed');
+      }
+      window.open(payload.download_url, '_blank', 'noopener,noreferrer');
+    } catch (error) {
+      record.downloadError = error.message;
+      records.set(id, record);
+      render();
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Download';
+    }
+  }
+
   elements.type.addEventListener('change', () => {
     const type = jobTypes[elements.type.value];
     elements.operator.textContent = type.operator;
     elements.help.textContent = type.help;
-    document.querySelector('#file-job-fields').hidden = elements.type.value !== 'csv_processing';
   });
 
   elements.form.addEventListener('submit', async (event) => {
@@ -265,10 +385,6 @@
       a: Number(data.get('a')),
       b: Number(data.get('b')),
     };
-      if (body.type === 'csv_processing') {
-        body.input_path = String(data.get('input_path') || '').trim();
-        body.query = String(data.get('query') || '');
-      }
     submit.disabled = true;
     elements.formMessage.className = 'form-message';
     elements.formMessage.textContent = 'Submitting job…';
@@ -281,6 +397,49 @@
       elements.formMessage.textContent = error.message;
     } finally {
       submit.disabled = false;
+    }
+  });
+
+  elements.fileType.addEventListener('change', () => {
+    const isCSV = elements.fileType.value === 'csv_processing';
+    elements.fileQueryField.hidden = !isCSV;
+    elements.fileQuery.required = isCSV;
+    elements.fileTypeHelp.textContent = fileTypeHelp[elements.fileType.value];
+  });
+
+  elements.fileForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const submit = elements.fileForm.querySelector('button[type="submit"]');
+    const inputKey = elements.s3File.value;
+    const type = elements.fileType.value;
+    const query = elements.fileQuery.value.trim();
+    if (!inputKey) {
+      elements.fileFormMessage.className = 'form-message error';
+      elements.fileFormMessage.textContent = 'Choose an S3 input file first.';
+      return;
+    }
+    if (type === 'csv_processing' && !query) {
+      elements.fileFormMessage.className = 'form-message error';
+      elements.fileFormMessage.textContent = 'Enter an exact CSV cell value to search for.';
+      elements.fileQuery.focus();
+      return;
+    }
+    const body = { type, input_key: inputKey };
+    if (type === 'csv_processing') body.query = query;
+    submit.disabled = true;
+    elements.refreshFiles.disabled = true;
+    elements.fileFormMessage.className = 'form-message';
+    elements.fileFormMessage.textContent = 'Submitting file job…';
+    try {
+      const job = await createJob(body);
+      elements.fileFormMessage.textContent = `Job ${job.ID} submitted`;
+      rememberJob(job.ID);
+    } catch (error) {
+      elements.fileFormMessage.className = 'form-message error';
+      elements.fileFormMessage.textContent = error.message;
+    } finally {
+      submit.disabled = false;
+      elements.refreshFiles.disabled = false;
     }
   });
 
@@ -322,6 +481,7 @@
   });
 
   document.querySelector('#refresh-button').addEventListener('click', refreshJobs);
+  elements.refreshFiles.addEventListener('click', refreshInputFiles);
   document.querySelector('#clear-history').addEventListener('click', () => {
     jobIDs = [];
     records.clear();
@@ -331,6 +491,9 @@
   });
 
   render();
+  elements.fileQueryField.hidden = false;
+  elements.fileQuery.required = true;
+  refreshInputFiles();
   refreshJobs();
   window.setInterval(refreshJobs, refreshEveryMs);
 })();

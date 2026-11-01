@@ -54,8 +54,8 @@ Open [http://localhost:8080](http://localhost:8080) to use the dashboard. The se
 ### Create a job
 
 `POST /jobs` accepts a JSON object with a `type`. Numeric jobs use integer
-operands `a` and `b`; local file jobs use `input_path`, and CSV searches also
-use `query`:
+operands `a` and `b`; S3-backed file jobs use an existing `input_key` below
+the bucket's `input/` prefix, and CSV searches also use `query`:
 
 ```sh
 curl -i http://localhost:8080/jobs \
@@ -74,16 +74,14 @@ On success, the API returns `201 Created` and the job record, including its gene
 | `fibonacci` | Calculates a Fibonacci number; `a` must be 0–46. | `a` | Fibonacci value |
 | `prime_count` | Counts primes up to `a`; `a` must be 2–10,000,000. | `a` | Prime count |
 | `retry_demo` | Fails for the first `a` attempts, then succeeds. | `a` retries, `b` result | `b` |
-| `image_processing` | Validates a local image file. | `input_path` | File size in bytes |
-| `log_analysis` | Counts lines containing `ERROR`. | `input_path` | Error-line count |
-| `csv_processing` | Counts exact cell matches for a value. | `input_path`, `query` | Match count |
+| `image_processing` | Validates an existing S3 image object. | `input_key` | Not processed from S3 until a later stage |
+| `log_analysis` | References an existing S3 log object. | `input_key` | Not processed from S3 until a later stage |
+| `csv_processing` | References an existing S3 CSV object. | `input_key`, `query` | Not processed from S3 until a later stage |
 
-Local file jobs read only from `JOB_DATA_DIR` (default `data/jobs`). Apply
-`backend/migrations/001_local_job_inputs.sql`, place the input file below that
-directory, and submit its relative path in `input_path`. Paths outside the
-configured directory are rejected.
-
-Apply `backend/migrations/002_csv_query.sql` for CSV value searching.
+Apply `backend/migrations/001_local_job_inputs.sql`,
+`backend/migrations/002_csv_query.sql`, and
+`backend/migrations/003_s3_input_keys.sql`. File-job keys must be under
+`input/`; the API verifies that the referenced S3 object exists before queuing.
 
 Unknown fields, malformed JSON, unsupported job types, and invalid inputs return `400 Bad Request`.
 
@@ -95,7 +93,13 @@ Use the ID returned by job creation:
 curl http://localhost:8080/jobs/job-<id>
 ```
 
-The response includes the job's status and result, retry count, current attempt, and worker/lease details when applicable. A missing ID returns `404 Not Found`.
+The response includes the job's status and result, retry count, current attempt, and worker/lease details when applicable. Completed S3-backed file jobs also include their private `output_key`. A missing ID returns `404 Not Found`.
+
+For a completed file-processing job, `GET /jobs/{id}/download` returns a
+short-lived presigned S3 URL. The URL lifetime defaults to 15 minutes and can
+be configured with `S3_PRESIGNED_URL_EXPIRY_SECONDS` (up to 7 days). The
+endpoint signs only the stored `output_key` under `output/`; it never accepts
+an arbitrary S3 key from the client.
 
 Jobs move through `queued`, `processing`, and either `completed` or `failed`. Workers claim jobs in PostgreSQL, renew time-limited leases while processing, and reject stale attempts from completing a job. Failed attempts and expired leases are retried up to the configured limit (three attempts); the recovery loop runs every two seconds.
 
